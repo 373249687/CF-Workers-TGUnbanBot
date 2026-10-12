@@ -1480,8 +1480,17 @@ export default {
 					新成员数量: update.message?.new_chat_members?.length || 0,
 					有编辑消息: Boolean(update.edited_message),
 					有频道消息: Boolean(update.channel_post),
-					有消息反应: Boolean(update.message_reaction)
+					有消息反应: Boolean(update.message_reaction),
+					有成员状态变化: Boolean(update.chat_member)
 				}));
+				// 进群事件观测日志:确认 bot 是否收到入群通知。只要收到含 new_chat_members 的更新就输出,
+				// 早于一切业务分支(主群/非主群/建档/查杀),专用于诊断"新人进群但 bot 无反应"类问题。
+				if (Array.isArray(update.message?.new_chat_members) && update.message.new_chat_members.length > 0) {
+					const membersBrief = update.message.new_chat_members
+						.map((m) => `${m?.id ?? '?'}(${m?.first_name || ''}${m?.username ? '@' + m.username : ''}${m?.is_bot ? ',bot' : ''})`)
+						.join(', ');
+					console.log(`[进群消息] 收到入群事件: 群="${update.message.chat?.title || ''}"(${update.message.chat?.id}), 新成员 ${update.message.new_chat_members.length} 人: ${membersBrief}`);
+				}
 
 				// 处理消息
 				if (update.message) {
@@ -1494,8 +1503,12 @@ export default {
 					if (!consumed) {
 						await handleAdCallbackQuery(update.callback_query, env);
 					}
+				} else if (update.chat_member) {
+					// 成员状态变化(Bot API 7.2+,需 allowed_updates 订阅 chat_member):大群/隐藏成员列表等场景下
+					// Telegram 可能不发送 new_chat_members 服务消息,本分支把"新人进群"可靠接回既有入群处理链。
+					await handleChatMemberUpdate(update.chat_member, env);
 				} else {
-					console.log('[Telegram更新] 跳过：update.message 和 update.callback_query 都为空，当前代码只处理普通消息和投票回调。');
+					console.log('[Telegram更新] 跳过：update.message、update.callback_query 和 update.chat_member 都为空，当前代码只处理普通消息、投票回调与成员变化。');
 				}
 
 				return new Response('OK');
@@ -1553,9 +1566,11 @@ async function handleInitialization(request) {
 		webhookUrl.pathname = '/';
 
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
+		// allowed_updates 说明:chat_member(Bot API 7.2+)为成员状态变化事件——大群/隐藏成员列表等场景下
+		// Telegram 可能不发送 new_chat_members 服务消息,必须订阅 chat_member 才能可靠捕获"新人进群"。
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			allowed_updates: ['message', 'callback_query']
+			allowed_updates: ['message', 'callback_query', 'chat_member']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -1853,9 +1868,12 @@ async function markUserGroupStatus(env, userId, status, chatId) {
 //       "联网黑名单自动查杀"当场禁言,违背源码两处显式承诺("白名单状态已记录,待其重新入群时不会触发查杀")。
 // 复用既有 helper(函数体零改动):dbGetUserGroupStatus 在"用户无行/本群无记录/异常"时一律返回 null;
 //       dbSetUserGroupStatus 为 upsert,用户无行时建 "仅 tgid + active_group_ids + created_at" 的档案。
-// 返回 true 表示本次实际完成了"首次建档"(原本无记录且写入成功,供外层打日志);已有记录或写入失败返回 false。
+// 返回 true 表示本次实际完成了"首次建档"(原本无记录且写入成功);已有记录或写入失败返回 false。
 async function ensureUserRecordOnJoin(env, userId, chatId) {
-	if (!isDbReady(env)) return false;
+	if (!isDbReady(env)) {
+		console.log(`[入群建档] 跳过: 数据库未就绪(未绑定 D1), tgid=${userId}, chatId=${chatId}`);
+		return false;
+	}
 	if (userId === undefined || userId === null) return false;
 	if (chatId === undefined || chatId === null) return false;
 	try {
@@ -1865,7 +1883,17 @@ async function ensureUserRecordOnJoin(env, userId, chatId) {
 		const now = Math.floor(Date.now() / 1000);
 		// 写入:无记录 → 建档"健康";已有记录 → status 原样写回 + 刷新 joinedAt(不传非法值不清零,见 dbSetUserGroupStatus 第 5 参语义)。
 		const written = await dbSetUserGroupStatus(env, userId, chatId, existingStatus || GROUP_MEMBER_STATUS.HEALTHY, now);
-		return written && existingStatus === null;
+		// 三类结果均输出观测日志(写入失败 / 首次建档 / 已存在记录),便于线上核对进群建档行为
+		if (!written) {
+			console.error(`[入群建档] 写入失败: tgid=${userId}, chatId=${chatId}`);
+			return false;
+		}
+		if (existingStatus === null) {
+			console.log(`[入群建档] 已建档(首次): tgid=${userId}, chatId=${chatId}, joinedAt=${now}`);
+			return true;
+		}
+		console.log(`[入群建档] 已存在「${existingStatus}」记录,仅刷新进群时间: tgid=${userId}, chatId=${chatId}, joinedAt=${now}`);
+		return false;
 	} catch (error) {
 		// 契约:本函数永不向上抛错(与 markUserGroupStatus 同风格);异常按"未完成建档"返回 false,不阻塞入群处理主流程。
 		console.error('[DB] 记录入群时间失败:', error.message);
@@ -2240,6 +2268,37 @@ function getNewMemberLogInfo(message, member) {
 	};
 }
 
+// 处理 chat_member 类型的 update(成员状态变化;Bot API 7.2+,需 setWebhook allowed_updates 订阅 chat_member)。
+// 背景:大群/隐藏成员列表等场景下 Telegram 不发送 new_chat_members 服务消息(社区验证事实),
+//       chat_member 是官方推荐的可靠替代——"验证新用户"类机器人均依赖它。
+// 判定「新加入」:old_chat_member.status 为 left(此前不在群)、new_chat_member.status 为 member/restricted(现已进群),
+//       且成员为真人(is_bot 跳过,与入群建档/查杀"只处理真人"口径一致);其余状态变化(离开/禁言/权限等)静默忽略。
+// 命中则转换为一则虚拟的 new_chat_members 消息,复用 handleNewChatMemberBots 全链路
+//       (建档 + joinedAt + 非主群联网查杀 + 主群本地黑名单拦截),与真实服务消息完全同路径。
+// 幂等:极少数双事件场景(服务消息与 chat_member 同时到达)重复执行亦无副作用——DB 侧均为 upsert(仅重复刷新 joinedAt);
+//       容错:整函数 try/catch,异常只记日志,保证 webhook 始终正常响应。
+async function handleChatMemberUpdate(chatMemberUpdate, env) {
+	try {
+		const chat = chatMemberUpdate?.chat;
+		const oldMember = chatMemberUpdate?.old_chat_member;
+		const newMember = chatMemberUpdate?.new_chat_member;
+		const user = newMember?.user;
+		if (!chat || !user) return;
+		const wasAbsent = oldMember?.status === 'left';
+		const isJoinedNow = newMember?.status === 'member' || newMember?.status === 'restricted';
+		if (!wasAbsent || !isJoinedNow || user.is_bot) return;
+		console.log(`[进群消息] 收到入群事件(chat_member): 群="${chat.title || ''}"(${chat.id}), 新成员: ${user.id}(${user.first_name || ''}${user.username ? '@' + user.username : ''})`);
+		await handleNewChatMemberBots({
+			chat,
+			from: chatMemberUpdate.from || user,
+			date: chatMemberUpdate.date,
+			new_chat_members: [user]
+		}, env);
+	} catch (error) {
+		console.error('[进群消息] chat_member 处理异常:', error.message);
+	}
+}
+
 async function handleNewChatMemberBots(message, env) {
 	const chat = message.chat;
 	const newMembers = message.new_chat_members;
@@ -2250,7 +2309,8 @@ async function handleNewChatMemberBots(message, env) {
 
 	logBotModeration('new-members:found', {
 		...getMessageLogInfo(message),
-		新成员数量: newMembers.length
+		新成员数量: newMembers.length,
+		成员: newMembers.map((m) => `${m?.id ?? '?'}${m?.is_bot ? '(bot)' : ''}`).join(', ')
 	});
 
 	if (!chat || !isMainGroup(chat.id)) {
@@ -2269,11 +2329,11 @@ async function handleNewChatMemberBots(message, env) {
 			for (const member of newMembers) {
 				if (!member || member.is_bot) continue;
 				if (member.id === undefined || member.id === null) continue;
-				const created = await ensureUserRecordOnJoin(env, member.id, chat.id);
-				if (created) {
-					console.log(`[入群建档] 已建档: tgid=${member.id}, chatId=${chat.id}`);
-				}
+				// 建档/刷时间的观测日志由 ensureUserRecordOnJoin 内部统一输出(首次建档/已存在/写入失败三类)
+				await ensureUserRecordOnJoin(env, member.id, chat.id);
 			}
+		} else {
+			console.log('[入群建档] 跳过: 数据库未就绪(未绑定 D1),无法为入群成员建档');
 		}
 		return true;
 	}
@@ -2297,9 +2357,8 @@ async function handleNewChatMemberBots(message, env) {
 			// 入群即时建档 + 记录入群时间(主群):为新入群真人成员立即建档,不依赖其后续发言;
 			// 同时写入"最近一次入群时间戳"(joinedAt,秒级),只有"进群消息"会触发该时间更新。
 			// 本群已有记录时 status 原样保留(只增不改);命中本地黑名单者随后被封禁覆写为"封禁",最终状态正确。
-			if (await ensureUserRecordOnJoin(env, member.id, chat.id)) {
-				console.log(`[入群建档] 已建档: tgid=${member.id}, chatId=${chat.id}`);
-			}
+			// 建档/刷时间的观测日志由 ensureUserRecordOnJoin 内部统一输出(首次建档/已存在/写入失败三类)
+			await ensureUserRecordOnJoin(env, member.id, chat.id);
 			try {
 				const blacklistCheck = await checkBlacklist(member.id, env);
 				if (blacklistCheck.isBlacklisted) {
