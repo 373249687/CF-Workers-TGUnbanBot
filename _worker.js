@@ -1816,6 +1816,29 @@ async function markUserGroupStatus(env, userId, status, chatId) {
 	}
 }
 
+// 入群即时建档:收到进群消息时,确保新入群真人在"本群"有用户记录(仅补写"健康"档),不等其发言。
+// 定位:既有"发言建档"(recordUserActivity)依赖成员先发言才入库;而入群服务消息的 from 是"拉人者"而非
+//       被拉入的新成员本人,故新成员本身不会因此入库——本函数修补该空档,对所有群(主群/非主群)生效。
+// 与查杀(handleNetworkBlacklistKill)的关系:非主群分支中查杀先跑,无记录用户由其 record 分支建档(本群=健康),
+//       随后本函数读到已有记录即零改动,故查杀行为逐字不变;本函数另外覆盖"bot 非本群管理员"(查杀整群跳过)的群。
+// ⚠️ "只增不改"不变量(曾有 P1 事故):仅当本群记录缺失(含用户无行)时才补写"健康";本群已有任何记录
+//       (白名单/禁言/封禁/管理员等)时零改动。原因:若把白名单用户的本群状态覆写为"健康",其重入群时会被
+//       "联网黑名单自动查杀"当场禁言,违背源码两处显式承诺("白名单状态已记录,待其重新入群时不会触发查杀")。
+// 复用既有 helper(函数体零改动):dbGetUserGroupStatus 在"用户无行/本群无记录/异常"时一律返回 null;
+//       dbSetUserGroupStatus 为 upsert,用户无行时建 "仅 tgid + active_group_ids + created_at" 的档案。
+// 返回 true 表示本次实际新建了本群记录(供外层打日志);已有记录或写入失败返回 false。
+async function ensureUserRecordOnJoin(env, userId, chatId) {
+	if (!isDbReady(env)) return false;
+	if (userId === undefined || userId === null) return false;
+	if (chatId === undefined || chatId === null) return false;
+	// 先读本群状态:已有任何记录(含白名单/禁言/封禁/管理员)→ 直接返回,零改动(只增不改)。
+	const existingStatus = await dbGetUserGroupStatus(env, userId, chatId);
+	if (existingStatus !== null) return false;
+	// 本群无记录(用户无行 / 本群无记录 / 读取异常均返回 null)→ 补写"健康"建档。
+	// 返回值直连写入结果:写入失败(false)→ 返回 false,外层不误打"已建档"日志(与上方注释语义一致)。
+	return await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.HEALTHY);
+}
+
 // 尽力获取某用户在任一主群的 user 对象(用于 /check 等场景展示资料):
 // 逐主群 getChatMember,取第一个能返回 user 的群;查询失败/用户不在群则继续尝试下一个主群。
 async function getManagedGroupUser(userId) {
@@ -2205,6 +2228,19 @@ async function handleNewChatMemberBots(message, env) {
 		} catch (error) {
 			console.error('[机器人风控] 联网查杀(入群)异常:', error.message);
 		}
+		// 入群即时建档(非主群):为新入群真人成员建档,不依赖其后续发言。
+		// 置于查杀之后:无记录用户仍由查杀 record 分支先建档,本函数读到已有记录即零改动(查杀行为逐字不变);
+		// 同时覆盖"bot 非本群管理员"(查杀整群跳过)的群。守卫 isDbReady(env) && chat,逐人只处理真人。
+		if (isDbReady(env) && chat) {
+			for (const member of newMembers) {
+				if (!member || member.is_bot) continue;
+				if (member.id === undefined || member.id === null) continue;
+				const created = await ensureUserRecordOnJoin(env, member.id, chat.id);
+				if (created) {
+					console.log(`[入群建档] 已建档: tgid=${member.id}, chatId=${chat.id}`);
+				}
+			}
+		}
 		return true;
 	}
 
@@ -2223,6 +2259,11 @@ async function handleNewChatMemberBots(message, env) {
 			if (!member?.id) {
 				logBotModeration('skip:new-member-without-id', logInfo);
 				continue;
+			}
+			// 入群即时建档(主群):为新入群真人成员立即建档,不依赖其后续发言。
+			// 本群无记录才补写"健康"(只增不改);命中本地黑名单者随后被封禁覆写为"封禁",最终状态正确。
+			if (await ensureUserRecordOnJoin(env, member.id, chat.id)) {
+				console.log(`[入群建档] 已建档: tgid=${member.id}, chatId=${chat.id}`);
 			}
 			try {
 				const blacklistCheck = await checkBlacklist(member.id, env);
