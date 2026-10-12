@@ -219,9 +219,10 @@ function normalizeGroupStatus(status) {
 	return GROUP_MEMBER_STATUS.HEALTHY;
 }
 
-// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status }]:
-// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康' }(历史数据无状态,默认健康);
-// - 新格式({ id, status })→ 校验 status,非法值回退健康;
+// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status, joinedAt }]:
+// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康', joinedAt: 0 }(历史数据无状态/时间,默认健康+未知);
+// - 新格式({ id, status, joinedAt })→ 校验 status,非法值回退健康;
+//   joinedAt 为"最近一次入群时间戳(秒级)",缺失 / 非数字 / 负数 / 非整数 → 归一化为 0(未知);
 // - 非法 JSON / 非数组 / 元素结构异常 → 返回空数组(上层重建,不抛错)。
 function parseActiveGroups(rawStr) {
 	if (!rawStr) return [];
@@ -237,11 +238,14 @@ function parseActiveGroups(rawStr) {
 		if (typeof item === 'string') {
 			const id = item.trim();
 			if (id === '') continue;
-			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY });
+			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY, joinedAt: 0 });
 		} else if (item && typeof item === 'object' && (typeof item.id === 'string' || typeof item.id === 'number')) {
 			const id = String(item.id);
 			if (id === '') continue;
-			groups.push({ id, status: normalizeGroupStatus(item.status) });
+			// joinedAt 归一化:仅正整数保留,其余(缺失/字符串/负数/小数/NaN/Infinity/0)一律 0
+			const rawJoinedAt = item.joinedAt;
+			const joinedAt = Number.isInteger(rawJoinedAt) && rawJoinedAt > 0 ? rawJoinedAt : 0;
+			groups.push({ id, status: normalizeGroupStatus(item.status), joinedAt });
 		}
 	}
 	return groups;
@@ -291,12 +295,15 @@ function describeCurrentChatStatus(chatStatus) {
 // 标记用户在某群组的状态(写入 active_group_ids 数组元素的 status):
 // - 用户不存在时自动建档(仅写 tgid + active_group_ids + created_at,不触碰其他列);
 // - 非法状态值回退"健康";读不到数组(非法 JSON 等)时按空数组重建;
+// - 第 5 参 joinedAt(可选,秒级入群时间戳)语义:仅当为正数时更新已有元素的 joinedAt,
+//   否则保持原值不动(严禁清零既有入群时间);新建元素缺省 0(未知);不传(undefined)视为"不更新";
 // - 成功返回 true,失败返回 false(不抛错,不阻塞上层业务)。
-async function dbSetUserGroupStatus(env, tgid, chatId, status) {
+async function dbSetUserGroupStatus(env, tgid, chatId, status, joinedAt) {
 	if (!hasDb(env)) return false;
 	const tgidStr = String(tgid);
 	const chatIdStr = String(chatId);
 	const normalizedStatus = normalizeGroupStatus(status);
+	const hasJoinedAt = Number.isFinite(joinedAt) && joinedAt > 0;
 	const now = Math.floor(Date.now() / 1000);
 	try {
 		let groups = [];
@@ -311,8 +318,10 @@ async function dbSetUserGroupStatus(env, tgid, chatId, status) {
 		const existing = groups.find((g) => g.id === chatIdStr);
 		if (existing) {
 			existing.status = normalizedStatus;
+			// 仅在显式传入有效 joinedAt 时更新,避免把既有入群时间误清零
+			if (hasJoinedAt) existing.joinedAt = Math.floor(joinedAt);
 		} else {
-			groups.push({ id: chatIdStr, status: normalizedStatus });
+			groups.push({ id: chatIdStr, status: normalizedStatus, joinedAt: hasJoinedAt ? Math.floor(joinedAt) : 0 });
 		}
 		await env.DB.prepare(
 			`INSERT INTO users (tgid, active_group_ids, created_at)
@@ -338,6 +347,22 @@ async function dbGetUserGroupStatus(env, tgid, chatId) {
 	} catch (error) {
 		console.error('[DB] 读取群组状态失败:', error.message);
 		return null;
+	}
+}
+
+// 读取用户在某群组的"最近一次入群时间戳"(秒级,active_group_ids 元素的 joinedAt)。
+// 只读入口:!hasDb / 用户不存在 / 无该群记录 / 字段异常(缺失/非正整数) → 一律返回 0(未知),不抛错。
+async function dbGetUserGroupJoinedAt(env, tgid, chatId) {
+	if (!hasDb(env)) return 0;
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row?.active_group_ids) return 0;
+		const groups = parseActiveGroups(row.active_group_ids);
+		const found = groups.find((g) => g.id === String(chatId));
+		return found && Number.isInteger(found.joinedAt) && found.joinedAt > 0 ? found.joinedAt : 0;
+	} catch (error) {
+		console.error('[DB] 读取入群时间失败:', error.message);
+		return 0;
 	}
 }
 
@@ -644,7 +669,8 @@ async function recordUserActivity(message, env) {
 		if (existingGroup) {
 			existingGroup.status = refreshedStatus;
 		} else {
-			groupIds.push({ id: chatIdStr, status: refreshedStatus });
+			// 新群组元素:joinedAt 置 0(未知);发言 ≠ 入群,严禁在此写入 now。
+			groupIds.push({ id: chatIdStr, status: refreshedStatus, joinedAt: 0 });
 		}
 
 		try {
@@ -1816,27 +1842,35 @@ async function markUserGroupStatus(env, userId, status, chatId) {
 	}
 }
 
-// 入群即时建档:收到进群消息时,确保新入群真人在"本群"有用户记录(仅补写"健康"档),不等其发言。
+// 入群即时建档 + 记录入群时间:收到进群消息时,确保新入群真人在"本群"有用户记录(仅补写"健康"档),
+// 并写入"最近一次入群时间戳"(秒级,active_group_ids 元素 joinedAt);只有"进群消息"才会触发该时间更新,不等其发言。
 // 定位:既有"发言建档"(recordUserActivity)依赖成员先发言才入库;而入群服务消息的 from 是"拉人者"而非
 //       被拉入的新成员本人,故新成员本身不会因此入库——本函数修补该空档,对所有群(主群/非主群)生效。
 // 与查杀(handleNetworkBlacklistKill)的关系:非主群分支中查杀先跑,无记录用户由其 record 分支建档(本群=健康),
-//       随后本函数读到已有记录即零改动,故查杀行为逐字不变;本函数另外覆盖"bot 非本群管理员"(查杀整群跳过)的群。
-// ⚠️ "只增不改"不变量(曾有 P1 事故):仅当本群记录缺失(含用户无行)时才补写"健康";本群已有任何记录
-//       (白名单/禁言/封禁/管理员等)时零改动。原因:若把白名单用户的本群状态覆写为"健康",其重入群时会被
+//       随后本函数读到已有记录即按"只增不改"刷新 joinedAt,故查杀行为逐字不变;本函数另外覆盖"bot 非本群管理员"(查杀整群跳过)的群。
+// ⚠️ "只增不改"不变量(曾有 P1 事故):本群已有任何记录(白名单/禁言/封禁/管理员等)时必须原样写回 status,绝不覆写为"健康";
+//       仅本群记录缺失(含用户无行)时才建档"健康"。原因:若把白名单用户的本群状态覆写为"健康",其重入群时会被
 //       "联网黑名单自动查杀"当场禁言,违背源码两处显式承诺("白名单状态已记录,待其重新入群时不会触发查杀")。
 // 复用既有 helper(函数体零改动):dbGetUserGroupStatus 在"用户无行/本群无记录/异常"时一律返回 null;
 //       dbSetUserGroupStatus 为 upsert,用户无行时建 "仅 tgid + active_group_ids + created_at" 的档案。
-// 返回 true 表示本次实际新建了本群记录(供外层打日志);已有记录或写入失败返回 false。
+// 返回 true 表示本次实际完成了"首次建档"(原本无记录且写入成功,供外层打日志);已有记录或写入失败返回 false。
 async function ensureUserRecordOnJoin(env, userId, chatId) {
 	if (!isDbReady(env)) return false;
 	if (userId === undefined || userId === null) return false;
 	if (chatId === undefined || chatId === null) return false;
-	// 先读本群状态:已有任何记录(含白名单/禁言/封禁/管理员)→ 直接返回,零改动(只增不改)。
-	const existingStatus = await dbGetUserGroupStatus(env, userId, chatId);
-	if (existingStatus !== null) return false;
-	// 本群无记录(用户无行 / 本群无记录 / 读取异常均返回 null)→ 补写"健康"建档。
-	// 返回值直连写入结果:写入失败(false)→ 返回 false,外层不误打"已建档"日志(与上方注释语义一致)。
-	return await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.HEALTHY);
+	try {
+		// 先读本群状态:已有任何记录(含白名单/禁言/封禁/管理员)时原样写回 status(只增不改),仅刷新 joinedAt。
+		const existingStatus = await dbGetUserGroupStatus(env, userId, chatId);
+		// 进群时间戳(秒级):只有"进群消息"触发本函数,发言路径(recordUserActivity)严禁写入 now。
+		const now = Math.floor(Date.now() / 1000);
+		// 写入:无记录 → 建档"健康";已有记录 → status 原样写回 + 刷新 joinedAt(不传非法值不清零,见 dbSetUserGroupStatus 第 5 参语义)。
+		const written = await dbSetUserGroupStatus(env, userId, chatId, existingStatus || GROUP_MEMBER_STATUS.HEALTHY, now);
+		return written && existingStatus === null;
+	} catch (error) {
+		// 契约:本函数永不向上抛错(与 markUserGroupStatus 同风格);异常按"未完成建档"返回 false,不阻塞入群处理主流程。
+		console.error('[DB] 记录入群时间失败:', error.message);
+		return false;
+	}
 }
 
 // 尽力获取某用户在任一主群的 user 对象(用于 /check 等场景展示资料):
@@ -2228,8 +2262,8 @@ async function handleNewChatMemberBots(message, env) {
 		} catch (error) {
 			console.error('[机器人风控] 联网查杀(入群)异常:', error.message);
 		}
-		// 入群即时建档(非主群):为新入群真人成员建档,不依赖其后续发言。
-		// 置于查杀之后:无记录用户仍由查杀 record 分支先建档,本函数读到已有记录即零改动(查杀行为逐字不变);
+		// 入群即时建档 + 记录入群时间(非主群):为新入群真人成员建档,不依赖其后续发言,并刷新"最近一次入群时间戳"。
+		// 置于查杀之后:无记录用户仍由查杀 record 分支先建档,本函数读到已有记录即按"只增不改"刷新 joinedAt(查杀行为逐字不变);
 		// 同时覆盖"bot 非本群管理员"(查杀整群跳过)的群。守卫 isDbReady(env) && chat,逐人只处理真人。
 		if (isDbReady(env) && chat) {
 			for (const member of newMembers) {
@@ -2260,8 +2294,9 @@ async function handleNewChatMemberBots(message, env) {
 				logBotModeration('skip:new-member-without-id', logInfo);
 				continue;
 			}
-			// 入群即时建档(主群):为新入群真人成员立即建档,不依赖其后续发言。
-			// 本群无记录才补写"健康"(只增不改);命中本地黑名单者随后被封禁覆写为"封禁",最终状态正确。
+			// 入群即时建档 + 记录入群时间(主群):为新入群真人成员立即建档,不依赖其后续发言;
+			// 同时写入"最近一次入群时间戳"(joinedAt,秒级),只有"进群消息"会触发该时间更新。
+			// 本群已有记录时 status 原样保留(只增不改);命中本地黑名单者随后被封禁覆写为"封禁",最终状态正确。
 			if (await ensureUserRecordOnJoin(env, member.id, chat.id)) {
 				console.log(`[入群建档] 已建档: tgid=${member.id}, chatId=${chat.id}`);
 			}
