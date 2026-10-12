@@ -2137,7 +2137,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (options.env) {
 			const recordedStatus = await dbGetUserGroupStatus(options.env, tgidToCheck, currentChatId);
 			if (recordedStatus && recordedStatus !== liveStatus) {
-				statusNote = `本地记录: ${describeCurrentChatStatus(recordedStatus).label}（与实时状态不一致，以实时为准）`;
+				statusNote = `本地记录: <b>${escapeHtml(describeCurrentChatStatus(recordedStatus).label)}</b>（与实时状态不一致，以实时为准）`;
 			}
 		}
 		// 入群时间(2026-10-13 新增):仅当 DB 已就绪且能读到本群 joinedAt>0 时展示该行;
@@ -2156,10 +2156,10 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (joinedAtSec > 0) {
 			// 该行内容全部由代码生成(数字 + 固定中文),无用户可控文本,故无需 escapeHtml;
 			// 格式:入群时间: YYYY-MM-DD HH:MM（相对时长）—— 冒号半角+空格、时长无空格、括号全角。
-			statusDetailLines.push(`入群时间: ${formatTimestamp(joinedAtSec).slice(0, 16)}（${formatRelativeTime(joinedAtSec)}）`);
+			statusDetailLines.push(`入群时间: <b>${formatTimestamp(joinedAtSec).slice(0, 16)}</b>（${formatRelativeTime(joinedAtSec)}）`);
 		}
 		if (statusNote) {
-			statusDetailLines.push(escapeHtml(statusNote));
+			statusDetailLines.push(statusNote);
 		}
 		statusDetailLines.forEach((line, i) => {
 			responseMessage += `${i === statusDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
