@@ -435,6 +435,62 @@ function formatGkyRecordedDate(raw) {
 	return match ? `${match[1]} ${match[2]}` : String(raw);
 }
 
+// 时间戳(epoch 秒)→ 相对当前时刻的"多久之前"文案(不含括号),用于 /check "入群时间"行的相对时长。
+// 2026-10-13 新增:与 formatTimestamp 配套,产出 "2026-10-05 19:24（7天前）" 中的 "7天前" 部分。
+// 规则(用户定稿):
+//   - diffSec < 1 小时(含负数/未来时钟偏差)→ "N分钟前"(N 向下取整,1..59;不足 1 分钟按 "1分钟前";2026-10-13 改版,弃用原 "刚刚");
+//   - 1 小时 ≤ diffSec < 24 小时 → "N小时前"(N 向下取整,1..23);
+//   - diffSec ≥ 24 小时 → 以日历视角做 年/月/天 逐级借位,省略所有为零的单位后拼接("1月7天前"/"1年22天前")。
+// ⚠️ 时区陷阱(必须遵守):Cloudflare Workers 生产运行时时区为 UTC,而"入群时间"语义为 UTC+8
+//   (与 formatTimestamp 对齐)。取日历字段必须先把时间戳 +8h 平移,再调用 getUTC* 系列方法;
+//   严禁使用本地时区的 getFullYear()/getMonth()/getDate()/getHours() 等,否则本机(GMT+8)测试通过、
+//   生产(UTC)显示错误。
+function formatRelativeTime(joinedAtSec, nowSec = Math.floor(Date.now() / 1000)) {
+	const diffSec = nowSec - joinedAtSec;
+	if (diffSec < 3600) return `${Math.max(1, Math.floor(diffSec / 60))}分钟前`;
+	if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}小时前`;
+
+	// 以 UTC+8 视角分解日历字段(与 formatTimestamp 同手法:先平移 8 小时再取 getUTC*)
+	const decomposeUtc8 = (ts) => {
+		const d = new Date((ts + 8 * 3600) * 1000);
+		return {
+			y: d.getUTCFullYear(),
+			m: d.getUTCMonth() + 1,
+			d: d.getUTCDate(),
+			h: d.getUTCHours(),
+			mi: d.getUTCMinutes(),
+			s: d.getUTCSeconds()
+		};
+	};
+	// 求 y 年 m 月(1-based)的天数:取 m 月最后一天(闰年由 Date 自动处理)
+	const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+
+	const join = decomposeUtc8(joinedAtSec);
+	const now = decomposeUtc8(nowSec);
+	// 逐级借位:秒不满借 1 分钟,分不满借 1 小时,时不满借 1 天
+	if (now.s < join.s) { now.s += 60; now.mi -= 1; }
+	if (now.mi < join.mi) { now.mi += 60; now.h -= 1; }
+	if (now.h < join.h) { now.h += 24; now.d -= 1; }
+	let days = now.d - join.d;
+	// 日为负时向"上一个月"继续借天:单次借位可能不够
+	//(如 3-01 减 1-31:先借 2 月 28 天仍为负,再借 1 月 31 天才够)
+	while (days < 0) {
+		now.m -= 1;
+		if (now.m < 1) { now.m = 12; now.y -= 1; }
+		days += daysInMonth(now.y, now.m);
+	}
+	let months = now.m - join.m;
+	if (months < 0) { months += 12; now.y -= 1; }
+	const years = now.y - join.y;
+
+	// 省略为零的单位,从大到小拼接(diffSec ≥ 24h 时至少含 "1天",不会全零)
+	const parts = [];
+	if (years > 0) parts.push(`${years}年`);
+	if (months > 0) parts.push(`${months}月`);
+	if (days > 0) parts.push(`${days}天`);
+	return `${parts.join('')}前`;
+}
+
 // 幂等建表 + 旧库列级升级(SQLite ALTER TABLE ADD COLUMN 补齐缺失列):
 // 新库直接按 DB_SCHEMA_SQL 全量建表;已上线的旧库 CREATE TABLE IF NOT EXISTS 不会补列,
 // 这里用 PRAGMA table_info 检查缺失列并逐个补齐,保证旧数据不丢、新字段有默认值。
@@ -2081,15 +2137,33 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (options.env) {
 			const recordedStatus = await dbGetUserGroupStatus(options.env, tgidToCheck, currentChatId);
 			if (recordedStatus && recordedStatus !== liveStatus) {
-				statusNote = `本地记录：${describeCurrentChatStatus(recordedStatus).label}（与实时状态不一致，以实时为准）`;
+				statusNote = `本地记录: ${describeCurrentChatStatus(recordedStatus).label}（与实时状态不一致，以实时为准）`;
 			}
+		}
+		// 入群时间(2026-10-13 新增):仅当 DB 已就绪且能读到本群 joinedAt>0 时展示该行;
+		// 语义 = 用户在"当前群"的最近一次入群时间戳(秒级,以 UTC+8 展示),附相对时长便于管理员快速判读。
+		// 无记录 / 字段异常 / env 缺失 → 不展示该行,也不加任何兜底文案(不做"入群时间: 未知")。
+		let joinedAtSec = 0;
+		if (options.env) {
+			joinedAtSec = await dbGetUserGroupJoinedAt(options.env, tgidToCheck, currentChatId);
 		}
 		const described = describeCurrentChatStatus(liveStatus);
 		responseMessage += `🧭 <b>当前群组状态:</b> ${described.icon} <b>${described.label}</b>\n`;
-		responseMessage += ` └ ${escapeHtml(described.desc)}\n`;
-		if (statusNote) {
-			responseMessage += ` └ ${escapeHtml(statusNote)}\n`;
+		// 树形层级排版(与下方"联网黑名单"区块完全同手法):明细行先收集进数组再统一挂靠在状态行下,
+		// 非末行前缀 " ├ "、末行前缀 " └ ";顺序 = 状态说明 desc → 入群时间(仅 joinedAtSec>0)→ 本地记录 statusNote。
+		// 仅 desc 单行时仍输出 " └ "(与改造前一致),向后兼容既有输出。
+		const statusDetailLines = [escapeHtml(described.desc)];
+		if (joinedAtSec > 0) {
+			// 该行内容全部由代码生成(数字 + 固定中文),无用户可控文本,故无需 escapeHtml;
+			// 格式:入群时间: YYYY-MM-DD HH:MM（相对时长）—— 冒号半角+空格、时长无空格、括号全角。
+			statusDetailLines.push(`入群时间: ${formatTimestamp(joinedAtSec).slice(0, 16)}（${formatRelativeTime(joinedAtSec)}）`);
 		}
+		if (statusNote) {
+			statusDetailLines.push(escapeHtml(statusNote));
+		}
+		statusDetailLines.forEach((line, i) => {
+			responseMessage += `${i === statusDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
+		});
 		responseMessage += '\n';
 	}
 
