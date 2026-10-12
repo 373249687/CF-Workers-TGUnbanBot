@@ -2545,7 +2545,6 @@ async function handleMessage(message, env) {
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 					responseMessage += `\n✅ 已在群内禁言 ${spamUserLabel}`;
 			} catch (error) {
-				console.error('群内禁言失败:', error);
 				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
 				if (error && error.code === 'TARGET_ALREADY_BANNED') {
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
@@ -2553,6 +2552,9 @@ async function handleMessage(message, env) {
 				} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
 					responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
 				} else {
+					// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
+					// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
+					console.error('群内禁言失败:', error);
 					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 				}
 			}
@@ -2880,7 +2882,6 @@ async function handleMessage(message, env) {
 				// 群内禁言成功 → 标记该用户在本群(当前主群)状态为"禁言"
 				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 			} catch (error) {
-				console.error('群内禁言失败:', error);
 				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
 				if (error && error.code === 'TARGET_ALREADY_BANNED') {
 					await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
@@ -2890,6 +2891,9 @@ async function handleMessage(message, env) {
 						? '✅ 已将用户加入联网黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
 						: `${responseMessage}\nℹ️ 该用户当前不在群内，未执行禁言`;
 				} else {
+					// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
+					// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
+					console.error('群内禁言失败:', error);
 					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 				}
 			}
