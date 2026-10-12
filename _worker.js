@@ -2234,9 +2234,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		} else {
 			responseMessage += `🌐 <b>GKY黑名单:</b> ✅ 正常\n`;
 		}
-	} else {
-		responseMessage += `🌐 <b>GKY黑名单:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
+	// 查询失败(!banlistData.success)时整块静默:不输出任何 GKY 相关字样,避免误导管理员
 
 	if (!options.includeReviewAction) {
 		return { text: responseMessage };
@@ -3189,7 +3188,8 @@ async function handleMessage(message, env) {
 		try {
 			const TG黑名单 = await handleBanlist(userId);
 			const banlistData = JSON.parse(TG黑名单);
-			if (banlistData.banned) {
+			// 仅在查询成功且确实命中封禁时才上报;查询失败(success:false)静默跳过,不广播、不提及 GKY
+			if (banlistData.success && banlistData.banned) {
 				const botUsername = await getBotUsername();
 				let infoMessage = `⚠️ 注意：您的账号在 GKYbot 联网黑名单中存在封禁记录。\n`;
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
@@ -3491,10 +3491,11 @@ async function handleBanlist(chatId) {
 			};
 		}
 
-		// 提取封禁信息
+		// 提取封禁信息(默认不预设 banned:true;仅当确实命中至少一个封禁字段时才判定为已封禁,
+		// 避免 GKYbot 返回 502 错误页等无法识别内容时被误判为已封禁)
 		const result = {
-			success: true,
-			banned: true,
+			success: false,
+			banned: false,
 			tgid: null,
 			chatId: null,
 			msgId: null,
@@ -3562,6 +3563,29 @@ async function handleBanlist(chatId) {
 			}
 		}
 
+		// 校验:页面既非"无记录",又未提取到任何封禁字段 → 无法识别(大概率是错误页/异常内容),
+		// 返回失败结构,绝不默认 banned:true
+		const hasBanField = result.recordedDate !== null || result.tgid !== null ||
+			result.chatId !== null || result.msgId !== null ||
+			result.reason !== null || result.info !== null;
+		if (!hasBanField) {
+			return {
+				success: false,
+				banned: false,
+				tgid: tgid,
+				chatId: null,
+				msgId: null,
+				reason: null,
+				info: null,
+				recordedDate: null,
+				error: '无法识别 GKYbot 返回内容'
+			};
+		}
+
+		// 至少命中一个真实封禁字段 → 判定为已封禁
+		result.success = true;
+		result.banned = true;
+
 		return result;
 	}
 
@@ -3572,15 +3596,26 @@ async function handleBanlist(chatId) {
 		});
 	}
 
-	// 访问原始的 banlist API
+	// 访问原始的 banlist API(网络异常/非 2xx 一律视为查询失败,显式返回 banned:false,绝不误判为已封禁)
 	const targetUrl = `https://gkybot.gmeow.cc/banlist?tgid=${chatId}`;
-	const response = await fetch(targetUrl);
-	const html = await response.text();
+	try {
+		const response = await fetch(targetUrl);
+		if (!response.ok) {
+			// 502/500 等错误页不能送进解析器(否则会被误判);仅记日志便于线上观测,不进用户可见文案
+			console.error(`GKYbot 查询失败: HTTP ${response.status} (tgid=${chatId})`);
+			return JSON.stringify({ success: false, banned: false, tgid: chatId, error: 'GKYbot 返回 HTTP ' + response.status });
+		}
+		const html = await response.text();
 
-	// 解析 HTML 内容
-	const result = parseBanlistHTML(html, chatId);
+		// 解析 HTML 内容
+		const result = parseBanlistHTML(html, chatId);
 
-	return JSON.stringify(result);
+		return JSON.stringify(result);
+	} catch (error) {
+		// 异常不得上抛给调用方,统一返回同构失败 JSON
+		console.error(`GKYbot 查询异常: ${error.message} (tgid=${chatId})`);
+		return JSON.stringify({ success: false, banned: false, tgid: chatId, error: error.message });
+	}
 }
 
 // 通过群组ID获取群组信息
