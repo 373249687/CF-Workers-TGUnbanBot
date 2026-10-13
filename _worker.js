@@ -2550,30 +2550,30 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 请回复要禁言的用户消息后再发送 <code>/spam</code>');
 				return;
 			}
-		try {
-			await muteChatMember(chatId, repliedUserId);
-			await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
-			// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
-			// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
-			// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
-			const muteUserLabel = message.reply_to_message?.from
-				? formatBannedUserLabel(message.reply_to_message.from)
-				: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-			await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
-			// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
-			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
-			await deleteMessage(chatId, message.reply_to_message.message_id);
-		} catch (error) {
-			// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
-			if (error && error.code === 'TARGET_ALREADY_BANNED') {
-				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-				await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
-				// deleteMessage 内部已 try-catch,独立于禁言成败
+			try {
+				await muteChatMember(chatId, repliedUserId);
+				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
+				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
+				// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
+				// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
+				const muteUserLabel = message.reply_to_message?.from
+					? formatBannedUserLabel(message.reply_to_message.from)
+					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
+				// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
+				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 				await deleteMessage(chatId, message.reply_to_message.message_id);
-			} else {
-				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+			} catch (error) {
+				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
+				if (error && error.code === 'TARGET_ALREADY_BANNED') {
+					await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+					await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
+					// deleteMessage 内部已 try-catch,独立于禁言成败
+					await deleteMessage(chatId, message.reply_to_message.message_id);
+				} else {
+					await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+				}
 			}
-		}
 			return;
 		}
 
@@ -2617,20 +2617,20 @@ async function handleMessage(message, env) {
 					await muteChatMember(chatId, repliedUserId);
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 					responseMessage += `\n✅ 已在群内禁言 ${spamUserLabel}`;
-			} catch (error) {
-				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
-				if (error && error.code === 'TARGET_ALREADY_BANNED') {
-					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
-					responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
-				} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
-					responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
-				} else {
-					// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
-					// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
-					console.error('群内禁言失败:', error);
-					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+				} catch (error) {
+					// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
+					if (error && error.code === 'TARGET_ALREADY_BANNED') {
+						await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
+						responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
+					} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+						responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
+					} else {
+						// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
+						// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
+						console.error('群内禁言失败:', error);
+						responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+					}
 				}
-			}
 			}
 			// 回复 /spam 场景:被回复的这条消息即违规内容,拉黑处理成功后同步删除
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
@@ -2758,38 +2758,38 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-// 占位 + 编辑落定(用户反馈:之前占位与查询结果两条消息挤在一起不美观):
-	// 改为先发占位,捕获 messageId,最终结果用 editMessageText 替换占位,
-	// 对话上下文里只剩一条消息,管理员体验更清晰。
-	const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
-	const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
-	if (!placeholderMessageId) {
-		console.error('[/check] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
-	}
+		// 占位 + 编辑落定(用户反馈:之前占位与查询结果两条消息挤在一起不美观):
+		// 改为先发占位,捕获 messageId,最终结果用 editMessageText 替换占位,
+		// 对话上下文里只剩一条消息,管理员体验更清晰。
+		const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
+		const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
+		if (!placeholderMessageId) {
+			console.error('[/check] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
+		}
 
-	let targetUser = null;
-	if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
-		targetUser = repliedUser;
-	} else {
-		targetUser = await getManagedGroupUser(tgidToCheck);
-	}
+		let targetUser = null;
+		if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
+			targetUser = repliedUser;
+		} else {
+			targetUser = await getManagedGroupUser(tgidToCheck);
+		}
 
-	const response = await buildBanlistCheckResponse(tgidToCheck, {
-		targetUser,
-		includeReviewAction: true,
-		actionInCurrentChat: isManagedGroupMessage(message),
-		// 群内场景顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
-		chatInfo: isManagedGroupMessage(message) ? message.chat : null,
-		env
-	});
-	// 编辑占位为最终结果(失败兜底:fallback 另发一条)
-	if (placeholderMessageId) {
-		await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
-	} else {
-		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+		const response = await buildBanlistCheckResponse(tgidToCheck, {
+			targetUser,
+			includeReviewAction: true,
+			actionInCurrentChat: isManagedGroupMessage(message),
+			// 群内场景顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
+			chatInfo: isManagedGroupMessage(message) ? message.chat : null,
+			env
+		});
+		// 编辑占位为最终结果(失败兜底:fallback 另发一条)
+		if (placeholderMessageId) {
+			await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
+		} else {
+			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+		}
+		return;
 	}
-	return;
-}
 
 	// 处理 /start 命令（包含 deep link 参数）
 	if (text && text.startsWith('/start')) {
@@ -2831,7 +2831,7 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-// 提取 TGID
+			// 提取 TGID
 			const tgidToCheck = parts[1].replace('check_', '');
 			// 占位 + 编辑落定(同 /check 命令):先发占位,再编辑为最终结果,避免两条独立消息挤一起
 			const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
@@ -2888,18 +2888,18 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
 				return;
 			}
-		try {
-			await banUserPermanently(chatId, targetUserId);
-			await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-			await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
-			// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
-			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
-			if (message.reply_to_message) {
-				await deleteMessage(chatId, message.reply_to_message.message_id);
+			try {
+				await banUserPermanently(chatId, targetUserId);
+				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
+				// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
+				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
+				if (message.reply_to_message) {
+					await deleteMessage(chatId, message.reply_to_message.message_id);
+				}
+			} catch (error) {
+				await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
 			}
-		} catch (error) {
-			await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
-		}
 			return;
 		}
 
@@ -3139,39 +3139,39 @@ async function handleMessage(message, env) {
 
 		// 恢复用户在全部主群的群内状态(逐主群 getChatMember → unban/restrict → 回写"健康"):
 		// 旧单群版按单一 GROUP_ID 的 kicked/restricted/left/member 分支处理;
-// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
-	try {
-		const restoreResult = await restoreUserInAllMainGroups(userId, env);
-		await sendTelegramMessage(chatId, restoreResult.message);
-		// 系统后台通知 → 按群定向发送:各主群只收本群相关的动作/失败明细(broadcastPerGroup),
-		// "用户不在群内"等信息性条目与隔壁主群的操作不进该群通知(2026-09-04 用户反馈)。
-		if (restoreResult.notifyMainGroups) {
-			// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
-			// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
-			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
-				try {
-					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
-				} catch (error) {
-					// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
-					console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
-				}
-			}
-		}
-	} catch (error) {
-		console.error('自助解封恢复失败:', error);
-		// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
+		// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
 		try {
 			const restoreResult = await restoreUserInAllMainGroups(userId, env);
 			await sendTelegramMessage(chatId, restoreResult.message);
-		if (restoreResult.notifyMainGroups) {
-			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
-				try {
-					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
-				} catch (error) {
-					console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
+			// 系统后台通知 → 按群定向发送:各主群只收本群相关的动作/失败明细(broadcastPerGroup),
+			// "用户不在群内"等信息性条目与隔壁主群的操作不进该群通知(2026-09-04 用户反馈)。
+			if (restoreResult.notifyMainGroups) {
+				// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
+				// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
+				for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+					try {
+						await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
+					} catch (error) {
+						// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
+						console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
+					}
 				}
 			}
-		}
+		} catch (error) {
+			console.error('自助解封恢复失败:', error);
+			// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
+			try {
+				const restoreResult = await restoreUserInAllMainGroups(userId, env);
+				await sendTelegramMessage(chatId, restoreResult.message);
+				if (restoreResult.notifyMainGroups) {
+					for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+						try {
+							await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
+						} catch (error) {
+							console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
+						}
+					}
+				}
 			} catch (restoreError) {
 				console.error('自助解封降级恢复失败:', restoreError);
 				await sendTelegramMessage(
