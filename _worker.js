@@ -7070,10 +7070,22 @@ async function restrictUserInChat(chatId, userId) {
 	return result;
 }
 
+// 联网查杀通知专用:被查杀用户名脱敏展示(首尾保留、中间 ***,防广告/违规用户名被 bot 复读造成二次传播)。
+// 复用 maskDisplayName(Unicode 码点安全,定义见本文件 /ad 区块);脱敏后仍保留 tg://user 链接
+// (回调侧 text_mention 实体复原与管理员核对均依赖该链接);无可展示名称时返回 null,
+// 由调用方兜底为纯 TGID 链接(TGID 本身无广告内容)。
+function formatMaskedUserMention(user) {
+	if (!user?.id) return null;
+	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || '';
+	if (!displayName) return null;
+	return `<a href="tg://user?id=${escapeHtml(user.id)}">${escapeHtml(maskDisplayName(displayName))}</a>`;
+}
+
 // 联网查杀"检测详情块"(通知与回调结果文案共用,保证操作后消息上半部分 UI 连续不跳变):
 // ⚠️ 标签行 + 联网黑名单命中说明 + 用户/TGID 详情。member 为被查杀用户对象(可为 null,兜底 tgid 链接)。
+// 用户名为脱敏展示(与 /spam /ban 封禁通知口径一致,防广告用户名二次传播),脱敏后仍保留 tg://user 链接。
 function buildNetKillDetailSection(member, tgid) {
-	const mention = (member && formatUserMention(member))
+	const mention = (member && formatMaskedUserMention(member))
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
 	return `⚠️ <b>#黑名单用户检测</b>
 
