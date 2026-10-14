@@ -2779,8 +2779,24 @@ function mtpParseCtor(r, id) {
 			const date = r.i32();
 			return { _: 'channelParticipantAdmin', user_id: userId, promoted_by: promotedBy, date };
 		}
-		case 1844969806: // channelParticipantBanned(date 不采用)
-			return { _: 'channelParticipantBanned', flags: r.i32() };
+		// ---- Peer predicate(消费字节; 供 channelParticipantBanned.kicked 的 peer 字段解析) ----
+		case 1498486562: // peerUser#59511722
+			return { _: 'peerUser', user_id: r.long() };
+		case 918946202: // peerChat#36c6019a
+			return { _: 'peerChat', chat_id: r.long() };
+		case 2728736542: // peerChannel#a2a5371e
+			return { _: 'peerChannel', channel_id: r.long() };
+		case 1844969806: // channelParticipantBanned#6df8014e(旧版, 无 rank)
+		case 3589320081: { // channelParticipantBanned#d5f0ad91(新版, rank:flags.2?string 位于末尾, 不影响 date 位置)
+			// schema: flags:int → peer:Peer → kicked_by:long → date:int → banned_rights → rank
+			// D6 修订(2025-10): date 官方语义 = "When did the user join the group" → 采用为入群时间;
+			// 沿用"读所需即止"模式, 不读取 date 之后的条件字段(banned_rights/rank)。
+			const flags = r.i32();
+			const peer = r.predicate();
+			const kicked_by = r.long();
+			const date = r.i32();
+			return { _: 'channelParticipantBanned', flags, left: Boolean(flags & 1), peer, kicked_by, date };
+		}
 		case 782418132: // auth.authorization
 			return { _: 'auth.authorization' };
 		case 0x64ff9fd5: // messages.chats
@@ -3412,12 +3428,14 @@ function mtpChannelIdFromChatId(chatId) {
 	return BigInt(s.replace('-', ''));
 }
 
-// D6 日期甄别:只信 channelParticipant / channelParticipantSelf(及按 D6 的 Admin)的 date;
-// Creator/Banned 不取; 0 < date <= now+60 才有效。
+// 日期甄别(2025-10 修订, 原 D6):channelParticipant / channelParticipantSelf / channelParticipantAdmin /
+// channelParticipantBanned 的 date 均视为入群时间; Creator(无 date 字段)不取; 0 < date <= now+60 才有效。
+// D6 修订依据: channelParticipantBanned.date 官方语义 = "When did the user join the group"(加入群组时间);
+//   left(是否已离开) 与 banned_rights(限制权限) 均不影响 date 语义; 用户实测与同类 bot 结果一致。
 function mtpSelectParticipantDate(participant, nowSec) {
 	if (!participant) return 0;
 	const t = participant._;
-	if (t !== 'channelParticipant' && t !== 'channelParticipantSelf' && t !== 'channelParticipantAdmin') return 0;
+	if (t !== 'channelParticipant' && t !== 'channelParticipantSelf' && t !== 'channelParticipantAdmin' && t !== 'channelParticipantBanned') return 0;
 	const date = Number(participant.date) || 0;
 	if (date > 0 && date <= nowSec + 60) return date;
 	return 0;
