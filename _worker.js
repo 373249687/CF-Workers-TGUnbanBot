@@ -8,6 +8,7 @@ let GROUP_ID_SET = [];
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
+let TG_API_ID = '2040', TG_API_HASH = 'b18441a1ff607e10a989891a5462e627';
 
 // ========================================================
 // 隐藏 /ad 举报投票功能
@@ -179,12 +180,15 @@ const DB_BAN_REASON_MAP = {
 // 用户在群组内的健康状态(active_group_ids 数组元素 status 字段取值):
 // 管理员=群主/管理员(可发言,豁免黑名单), 健康=普通正常成员(可发言),
 // 禁言=被 restrictChatMember 禁发消息, 封禁=被 banChatMember 踢出群组(含被踢后尚未重新加入)。
+// NOT_IN_CHAT 为 /check 群内现状展示专用的"未在该群"态:不写入 DB(不在 active_group_ids 允许值内),
+// 仅由 getChatMember 实时结果(left / 接口 400)推导,故 normalizeGroupStatus 不承认该值。
 const GROUP_MEMBER_STATUS = {
 	ADMIN: '管理员',
 	HEALTHY: '健康',
 	MUTED: '禁言',
 	BANNED: '封禁',
-	WHITELISTED: '白名单'
+	WHITELISTED: '白名单',
+	NOT_IN_CHAT: '未在该群'
 };
 
 // 群组管理员判定钩子(黑名单豁免 / 管理员状态标记用):
@@ -216,9 +220,10 @@ function normalizeGroupStatus(status) {
 	return GROUP_MEMBER_STATUS.HEALTHY;
 }
 
-// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status }]:
-// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康' }(历史数据无状态,默认健康);
-// - 新格式({ id, status })→ 校验 status,非法值回退健康;
+// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status, joinedAt }]:
+// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康', joinedAt: 0 }(历史数据无状态/时间,默认健康+未知);
+// - 新格式({ id, status, joinedAt })→ 校验 status,非法值回退健康;
+//   joinedAt 为"最近一次入群时间戳(秒级)",缺失 / 非数字 / 负数 / 非整数 → 归一化为 0(未知);
 // - 非法 JSON / 非数组 / 元素结构异常 → 返回空数组(上层重建,不抛错)。
 function parseActiveGroups(rawStr) {
 	if (!rawStr) return [];
@@ -234,11 +239,14 @@ function parseActiveGroups(rawStr) {
 		if (typeof item === 'string') {
 			const id = item.trim();
 			if (id === '') continue;
-			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY });
+			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY, joinedAt: 0 });
 		} else if (item && typeof item === 'object' && (typeof item.id === 'string' || typeof item.id === 'number')) {
 			const id = String(item.id);
 			if (id === '') continue;
-			groups.push({ id, status: normalizeGroupStatus(item.status) });
+			// joinedAt 归一化:仅正整数保留,其余(缺失/字符串/负数/小数/NaN/Infinity/0)一律 0
+			const rawJoinedAt = item.joinedAt;
+			const joinedAt = Number.isInteger(rawJoinedAt) && rawJoinedAt > 0 ? rawJoinedAt : 0;
+			groups.push({ id, status: normalizeGroupStatus(item.status), joinedAt });
 		}
 	}
 	return groups;
@@ -257,15 +265,46 @@ function mapTgStatusToGroupStatus(status, canSendMessages) {
 	return GROUP_MEMBER_STATUS.HEALTHY;
 }
 
+// /check 群内现状展示:状态 → 图标 + 专业表述(2026-09-23 新增)。
+// 与 GROUP_MEMBER_STATUS 五态一一对应,并额外支持"未在该群"(非五态,不写入 DB,仅用于 /check 实时展示):
+//   管理员/健康 → 可正常发言;禁言 → 被限制发言权限;封禁 → 已被踢出该群;
+//   白名单   → 本群黑名单豁免;未在该群 → getChatMember 判定非群成员(left 或接口 400)。
+// 语义说明(用户口径"怎么描述专业你就怎么来"):
+//   - "健康"面向管理员可读性弱,展示为「正常」并补一句"账号在本群无异常限制";
+//   - "封禁"严格表述为"已被移出该群"(Telegram banChatMember 即踢出+禁止再加入),不用"账号被封";
+//   - "未在该群"覆盖三种成因:主动退群(left)、从未加入(400)、被踢且未重新加入(400);
+//     不臆断成因,统一按"当前不在该群成员列表中"表述,避免误标为封禁。
+// 返回 { icon, label, desc }:desc 为纯中文描述(不含树形前缀),由调用方统一挂 " └ " 树形行。
+function describeCurrentChatStatus(chatStatus) {
+	switch (chatStatus) {
+		case GROUP_MEMBER_STATUS.ADMIN:
+			return { icon: '👑', label: '管理员', desc: '本群管理成员，不受联网黑名单限制' };
+		case GROUP_MEMBER_STATUS.MUTED:
+			return { icon: '🔇', label: '禁言', desc: '已被限制发言权限（可查看消息，无法发言）' };
+		case GROUP_MEMBER_STATUS.BANNED:
+			return { icon: '🚫', label: '封禁', desc: '已被移出本群并禁止重新加入' };
+		case GROUP_MEMBER_STATUS.WHITELISTED:
+			return { icon: '✅', label: '白名单', desc: '本群黑名单豁免成员' };
+		case GROUP_MEMBER_STATUS.NOT_IN_CHAT:
+			return { icon: '➖', label: '未在该群', desc: '当前不在本群成员列表中' };
+		case GROUP_MEMBER_STATUS.HEALTHY:
+		default:
+			return { icon: '✅', label: '正常', desc: '账号在本群无异常限制，可正常发言' };
+	}
+}
+
 // 标记用户在某群组的状态(写入 active_group_ids 数组元素的 status):
 // - 用户不存在时自动建档(仅写 tgid + active_group_ids + created_at,不触碰其他列);
 // - 非法状态值回退"健康";读不到数组(非法 JSON 等)时按空数组重建;
+// - 第 5 参 joinedAt(可选,秒级入群时间戳)语义:仅当为正数时更新已有元素的 joinedAt,
+//   否则保持原值不动(严禁清零既有入群时间);新建元素缺省 0(未知);不传(undefined)视为"不更新";
 // - 成功返回 true,失败返回 false(不抛错,不阻塞上层业务)。
-async function dbSetUserGroupStatus(env, tgid, chatId, status) {
+async function dbSetUserGroupStatus(env, tgid, chatId, status, joinedAt) {
 	if (!hasDb(env)) return false;
 	const tgidStr = String(tgid);
 	const chatIdStr = String(chatId);
 	const normalizedStatus = normalizeGroupStatus(status);
+	const hasJoinedAt = Number.isFinite(joinedAt) && joinedAt > 0;
 	const now = Math.floor(Date.now() / 1000);
 	try {
 		let groups = [];
@@ -280,8 +319,10 @@ async function dbSetUserGroupStatus(env, tgid, chatId, status) {
 		const existing = groups.find((g) => g.id === chatIdStr);
 		if (existing) {
 			existing.status = normalizedStatus;
+			// 仅在显式传入有效 joinedAt 时更新,避免把既有入群时间误清零
+			if (hasJoinedAt) existing.joinedAt = Math.floor(joinedAt);
 		} else {
-			groups.push({ id: chatIdStr, status: normalizedStatus });
+			groups.push({ id: chatIdStr, status: normalizedStatus, joinedAt: hasJoinedAt ? Math.floor(joinedAt) : 0 });
 		}
 		await env.DB.prepare(
 			`INSERT INTO users (tgid, active_group_ids, created_at)
@@ -307,6 +348,22 @@ async function dbGetUserGroupStatus(env, tgid, chatId) {
 	} catch (error) {
 		console.error('[DB] 读取群组状态失败:', error.message);
 		return null;
+	}
+}
+
+// 读取用户在某群组的"最近一次入群时间戳"(秒级,active_group_ids 元素的 joinedAt)。
+// 只读入口:!hasDb / 用户不存在 / 无该群记录 / 字段异常(缺失/非正整数) → 一律返回 0(未知),不抛错。
+async function dbGetUserGroupJoinedAt(env, tgid, chatId) {
+	if (!hasDb(env)) return 0;
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row?.active_group_ids) return 0;
+		const groups = parseActiveGroups(row.active_group_ids);
+		const found = groups.find((g) => g.id === String(chatId));
+		return found && Number.isInteger(found.joinedAt) && found.joinedAt > 0 ? found.joinedAt : 0;
+	} catch (error) {
+		console.error('[DB] 读取入群时间失败:', error.message);
+		return 0;
 	}
 }
 
@@ -377,6 +434,62 @@ function formatGkyRecordedDate(raw) {
 	if (!raw) return '';
 	const match = String(raw).match(/(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
 	return match ? `${match[1]} ${match[2]}` : String(raw);
+}
+
+// 时间戳(epoch 秒)→ 相对当前时刻的"多久之前"文案(不含括号),用于 /check "入群时间"行的相对时长。
+// 2026-10-13 新增:与 formatTimestamp 配套,产出 "2026-10-05 19:24（7天前）" 中的 "7天前" 部分。
+// 规则(用户定稿):
+//   - diffSec < 1 小时(含负数/未来时钟偏差)→ "N分钟前"(N 向下取整,1..59;不足 1 分钟按 "1分钟前";2026-10-13 改版,弃用原 "刚刚");
+//   - 1 小时 ≤ diffSec < 24 小时 → "N小时前"(N 向下取整,1..23);
+//   - diffSec ≥ 24 小时 → 以日历视角做 年/月/天 逐级借位,省略所有为零的单位后拼接("1月7天前"/"1年22天前")。
+// ⚠️ 时区陷阱(必须遵守):Cloudflare Workers 生产运行时时区为 UTC,而"入群时间"语义为 UTC+8
+//   (与 formatTimestamp 对齐)。取日历字段必须先把时间戳 +8h 平移,再调用 getUTC* 系列方法;
+//   严禁使用本地时区的 getFullYear()/getMonth()/getDate()/getHours() 等,否则本机(GMT+8)测试通过、
+//   生产(UTC)显示错误。
+function formatRelativeTime(joinedAtSec, nowSec = Math.floor(Date.now() / 1000)) {
+	const diffSec = nowSec - joinedAtSec;
+	if (diffSec < 3600) return `${Math.max(1, Math.floor(diffSec / 60))}分钟前`;
+	if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}小时前`;
+
+	// 以 UTC+8 视角分解日历字段(与 formatTimestamp 同手法:先平移 8 小时再取 getUTC*)
+	const decomposeUtc8 = (ts) => {
+		const d = new Date((ts + 8 * 3600) * 1000);
+		return {
+			y: d.getUTCFullYear(),
+			m: d.getUTCMonth() + 1,
+			d: d.getUTCDate(),
+			h: d.getUTCHours(),
+			mi: d.getUTCMinutes(),
+			s: d.getUTCSeconds()
+		};
+	};
+	// 求 y 年 m 月(1-based)的天数:取 m 月最后一天(闰年由 Date 自动处理)
+	const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+
+	const join = decomposeUtc8(joinedAtSec);
+	const now = decomposeUtc8(nowSec);
+	// 逐级借位:秒不满借 1 分钟,分不满借 1 小时,时不满借 1 天
+	if (now.s < join.s) { now.s += 60; now.mi -= 1; }
+	if (now.mi < join.mi) { now.mi += 60; now.h -= 1; }
+	if (now.h < join.h) { now.h += 24; now.d -= 1; }
+	let days = now.d - join.d;
+	// 日为负时向"上一个月"继续借天:单次借位可能不够
+	//(如 3-01 减 1-31:先借 2 月 28 天仍为负,再借 1 月 31 天才够)
+	while (days < 0) {
+		now.m -= 1;
+		if (now.m < 1) { now.m = 12; now.y -= 1; }
+		days += daysInMonth(now.y, now.m);
+	}
+	let months = now.m - join.m;
+	if (months < 0) { months += 12; now.y -= 1; }
+	const years = now.y - join.y;
+
+	// 省略为零的单位,从大到小拼接(diffSec ≥ 24h 时至少含 "1天",不会全零)
+	const parts = [];
+	if (years > 0) parts.push(`${years}年`);
+	if (months > 0) parts.push(`${months}月`);
+	if (days > 0) parts.push(`${days}天`);
+	return `${parts.join('')}前`;
 }
 
 // 幂等建表 + 旧库列级升级(SQLite ALTER TABLE ADD COLUMN 补齐缺失列):
@@ -613,7 +726,8 @@ async function recordUserActivity(message, env) {
 		if (existingGroup) {
 			existingGroup.status = refreshedStatus;
 		} else {
-			groupIds.push({ id: chatIdStr, status: refreshedStatus });
+			// 新群组元素:joinedAt 置 0(未知);发言 ≠ 入群,严禁在此写入 now。
+			groupIds.push({ id: chatIdStr, status: refreshedStatus, joinedAt: 0 });
 		}
 
 		try {
@@ -1386,6 +1500,7 @@ export default {
 		AD_GROUP_RULES = String(env.AD_GROUP_RULES || '').trim() || AD_GROUP_RULES;
 		AD_AI_MODELS = resolveAdAiModels(env.AD_AI_MODEL); // 整体替换模型列表(逗号分隔/JSON 数组/单模型;空回退内置默认)
 		AD_AI_TIMEOUT_MS = parseInt(env.AD_AI_TIMEOUT_MS) || AD_AI_TIMEOUT_MS;
+		TG_API_ID = env.TG_API_ID || TG_API_ID, TG_API_HASH = env.TG_API_HASH || TG_API_HASH;
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 		let TOKEN;
 
@@ -1423,22 +1538,35 @@ export default {
 					新成员数量: update.message?.new_chat_members?.length || 0,
 					有编辑消息: Boolean(update.edited_message),
 					有频道消息: Boolean(update.channel_post),
-					有消息反应: Boolean(update.message_reaction)
+					有消息反应: Boolean(update.message_reaction),
+					有成员状态变化: Boolean(update.chat_member)
 				}));
+				// 进群事件观测日志:确认 bot 是否收到入群通知。只要收到含 new_chat_members 的更新就输出,
+				// 早于一切业务分支(主群/非主群/建档/查杀),专用于诊断"新人进群但 bot 无反应"类问题。
+				if (Array.isArray(update.message?.new_chat_members) && update.message.new_chat_members.length > 0) {
+					const membersBrief = update.message.new_chat_members
+						.map((m) => `${m?.id ?? '?'}(${m?.first_name || ''}${m?.username ? '@' + m.username : ''}${m?.is_bot ? ',bot' : ''})`)
+						.join(', ');
+					console.log(`[进群消息] 收到入群事件: 群="${update.message.chat?.title || ''}"(${update.message.chat?.id}), 新成员 ${update.message.new_chat_members.length} 人: ${membersBrief}`);
+				}
 
 				// 处理消息
 				if (update.message) {
 					// 数据库版:对所有收到消息的 tgid 记录活动(资料快照/最后对话时间/活跃群组/消息计数)
 					await recordUserActivity(update.message, env);
-					await handleMessage(update.message, env);
+					await handleMessage(update.message, env, ctx);
 				} else if (update.callback_query) {
 					// 优先处理联网查杀按钮回调(cmk: 前缀),未被消费再交给 /ad 投票回调
 					const consumed = await handleNetworkKillCallbackQuery(update.callback_query, env);
 					if (!consumed) {
 						await handleAdCallbackQuery(update.callback_query, env);
 					}
+				} else if (update.chat_member) {
+					// 成员状态变化(Bot API 7.2+,需 allowed_updates 订阅 chat_member):大群/隐藏成员列表等场景下
+					// Telegram 可能不发送 new_chat_members 服务消息,本分支把"新人进群"可靠接回既有入群处理链。
+					await handleChatMemberUpdate(update.chat_member, env);
 				} else {
-					console.log('[Telegram更新] 跳过：update.message 和 update.callback_query 都为空，当前代码只处理普通消息和投票回调。');
+					console.log('[Telegram更新] 跳过：update.message、update.callback_query 和 update.chat_member 都为空，当前代码只处理普通消息、投票回调与成员变化。');
 				}
 
 				return new Response('OK');
@@ -1496,9 +1624,11 @@ async function handleInitialization(request) {
 		webhookUrl.pathname = '/';
 
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
+		// allowed_updates 说明:chat_member(Bot API 7.2+)为成员状态变化事件——大群/隐藏成员列表等场景下
+		// Telegram 可能不发送 new_chat_members 服务消息,必须订阅 chat_member 才能可靠捕获"新人进群"。
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			allowed_updates: ['message', 'callback_query']
+			allowed_updates: ['message', 'callback_query', 'chat_member']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -1785,6 +1915,50 @@ async function markUserGroupStatus(env, userId, status, chatId) {
 	}
 }
 
+// 入群即时建档 + 记录入群时间:收到进群消息时,确保新入群真人在"本群"有用户记录(仅补写"健康"档),
+// 并写入"最近一次入群时间戳"(秒级,active_group_ids 元素 joinedAt);只有"进群消息"才会触发该时间更新,不等其发言。
+// 定位:既有"发言建档"(recordUserActivity)依赖成员先发言才入库;而入群服务消息的 from 是"拉人者"而非
+//       被拉入的新成员本人,故新成员本身不会因此入库——本函数修补该空档,对所有群(主群/非主群)生效。
+// 与查杀(handleNetworkBlacklistKill)的关系:非主群分支中查杀先跑,无记录用户由其 record 分支建档(本群=健康),
+//       随后本函数读到已有记录即按"只增不改"刷新 joinedAt,故查杀行为逐字不变;本函数另外覆盖"bot 非本群管理员"(查杀整群跳过)的群。
+// ⚠️ "只增不改"不变量(曾有 P1 事故):本群已有任何记录(白名单/禁言/封禁/管理员等)时必须原样写回 status,绝不覆写为"健康";
+//       仅本群记录缺失(含用户无行)时才建档"健康"。原因:若把白名单用户的本群状态覆写为"健康",其重入群时会被
+//       "联网黑名单自动查杀"当场禁言,违背源码两处显式承诺("白名单状态已记录,待其重新入群时不会触发查杀")。
+// 复用既有 helper(函数体零改动):dbGetUserGroupStatus 在"用户无行/本群无记录/异常"时一律返回 null;
+//       dbSetUserGroupStatus 为 upsert,用户无行时建 "仅 tgid + active_group_ids + created_at" 的档案。
+// 返回 true 表示本次实际完成了"首次建档"(原本无记录且写入成功);已有记录或写入失败返回 false。
+async function ensureUserRecordOnJoin(env, userId, chatId) {
+	if (!isDbReady(env)) {
+		console.log(`[入群建档] 跳过: 数据库未就绪(未绑定 D1), tgid=${userId}, chatId=${chatId}`);
+		return false;
+	}
+	if (userId === undefined || userId === null) return false;
+	if (chatId === undefined || chatId === null) return false;
+	try {
+		// 先读本群状态:已有任何记录(含白名单/禁言/封禁/管理员)时原样写回 status(只增不改),仅刷新 joinedAt。
+		const existingStatus = await dbGetUserGroupStatus(env, userId, chatId);
+		// 进群时间戳(秒级):只有"进群消息"触发本函数,发言路径(recordUserActivity)严禁写入 now。
+		const now = Math.floor(Date.now() / 1000);
+		// 写入:无记录 → 建档"健康";已有记录 → status 原样写回 + 刷新 joinedAt(不传非法值不清零,见 dbSetUserGroupStatus 第 5 参语义)。
+		const written = await dbSetUserGroupStatus(env, userId, chatId, existingStatus || GROUP_MEMBER_STATUS.HEALTHY, now);
+		// 三类结果均输出观测日志(写入失败 / 首次建档 / 已存在记录),便于线上核对进群建档行为
+		if (!written) {
+			console.error(`[入群建档] 写入失败: tgid=${userId}, chatId=${chatId}`);
+			return false;
+		}
+		if (existingStatus === null) {
+			console.log(`[入群建档] 已建档(首次): tgid=${userId}, chatId=${chatId}, joinedAt=${now}`);
+			return true;
+		}
+		console.log(`[入群建档] 已存在「${existingStatus}」记录,仅刷新进群时间: tgid=${userId}, chatId=${chatId}, joinedAt=${now}`);
+		return false;
+	} catch (error) {
+		// 契约:本函数永不向上抛错(与 markUserGroupStatus 同风格);异常按"未完成建档"返回 false,不阻塞入群处理主流程。
+		console.error('[DB] 记录入群时间失败:', error.message);
+		return false;
+	}
+}
+
 // 尽力获取某用户在任一主群的 user 对象(用于 /check 等场景展示资料):
 // 逐主群 getChatMember,取第一个能返回 user 的群;查询失败/用户不在群则继续尝试下一个主群。
 async function getManagedGroupUser(userId) {
@@ -1800,6 +1974,29 @@ async function getManagedGroupUser(userId) {
 		}
 	}
 	return null;
+}
+
+// 查询某用户在"指定单个群"的实时群内状态(/check 群内顺带展示用,2026-09-23 新增):
+// 返回 GROUP_MEMBER_STATUS 之一(含 NOT_IN_CHAT);任何异常都不抛错,按"未在该群"降级。
+// 判定链:
+//   1) getChatMember 抛错(含 HTTP 400:用户不在群/群不存在)→ 未在该群;
+//   2) result.ok === false → 未在该群;
+//   3) 取 result.status('left'/'kicked'/'member'/'restricted'/'administrator'/'creator')与 can_send_messages
+//      走 mapTgStatusToGroupStatus;其中 'left' 明确表示已离开 → 未在该群(优先于"健康"兜底)。
+// 说明:DB 本地记录(dbGetUserGroupStatus)仅作辅助,不参与本函数判定——DB 可能滞后于 Telegram 实时状态,
+// "当前群组状态"以实时接口为准,DB 记录转而作为提示明细("本地记录: xxx")由上层拼装。
+async function resolveUserGroupStatusInChat(chatId, userId) {
+	try {
+		const statusResult = await checkUserStatusInChat(chatId, userId);
+		if (!statusResult?.result) return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+		const member = statusResult.result;
+		if (member.status === 'left') return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+		return mapTgStatusToGroupStatus(member.status, member.can_send_messages);
+	} catch (error) {
+		// getChatMember 失败(用户不在群 400 / 网络异常)统一按"未在该群"降级,不阻断 /check 主流程
+		console.log(`查询用户群内状态失败(chat ${chatId}, user ${userId}):`, error.message);
+		return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+	}
 }
 
 // 恢复用户在全部主群的状态(restoreUserInAllMainGroups)已在多主群核心辅助区定义,
@@ -1880,6 +2077,1509 @@ async function getBanOperatorLabel(operatorTgid) {
 		: `(<code>${safeTgid}</code>)`;
 }
 
+// [MTPROTO-START] ============================================================
+// /check 入群时间 MTProto 补录(增量功能,2026-10-14)
+// 设计规格: deliverables/software-company/tgunban-mtproto/design.md (T01–T05)
+// 归属: 单一连续区块, 便于 QA 切片; 不得落入 [DB-LAYER-START/END] 区间。
+// 关键约束:
+//   - 单文件零依赖; cloudflare:sockets 仅允许动态 import + try/catch + 隔离域 promise 缓存;
+//   - 全路径 try/catch, 任何失败绝不阻断 /check(零阻断);
+//   - 日志统一前缀 [MTProto]; 绝不打印 token / api_hash / auth_key / b 等密钥材料;
+//   - /check 补录经 ctx.waitUntil 后台执行, 完成后 editMessageText 二次编辑补上入群时间
+//     (偶发任务, 不再为 CPU 预算做保守妥协)。
+// ============================================================================
+
+// ---- 常量 ----
+const MTPROTO_KV_SESSION = 'mtproto:session:v1';
+const MTPROTO_KV_HANDSHAKE = 'mtproto:handshake:v1';
+const MTPROTO_SCHEMA_V = 2; // v2: 修复 server_salt 字节序 + session 级 seq_no 延续(旧 v1 会因版本不符被自动清除重建)
+const MTPROTO_ROUND_TIMEOUT_MS = 6000; // 单次 socket 操作超时(6–8s)
+const MTPROTO_COOLDOWN_SECONDS = 600;  // 握手连续失败后的冷却时长
+const MTPROTO_MAX_ATTEMPTS = 3;        // 连续失败次数上限, 达到后进入冷却
+const MTPROTO_LAYER = 158;             // invokeWithLayer 层号(参考库同款)
+const MTPROTO_DEFAULT_DC_ID = 2;       // 首选 DC(recon 实测连通)
+const MTPROTO_QUERYING_LINE = '⏳ 入群时间正在查询中...';
+const MTPROTO_FAILED_LINE = '⏳ 入群时间暂时无法获取';
+const MTPROTO_BG_MAX_STEPS = 5;        // 后台补录循环步数上限(轮A→轮B→迁移重试…)
+const MTPROTO_BG_DEADLINE_MS = 20000;  // 后台补录软预算(毫秒), 防 waitUntil 超时截断
+
+// 生产 DC 列表(端口 443)。来源: core.telegram.org 官方 + 参考库 telegramBaseClient。
+const MTPROTO_DC_LIST = [
+	{ id: 1, host: '149.154.175.53', port: 443 },
+	{ id: 2, host: '149.154.167.51', port: 443 },
+	{ id: 3, host: '149.154.175.100', port: 443 },
+	{ id: 4, host: '149.154.167.91', port: 443 },
+	{ id: 5, host: '91.108.56.130', port: 443 }
+];
+
+// Telegram 服务器 RSA 公钥(5 把)。来源: @mtproto/core/src/utils/rsa（常量照抄, 不引入依赖）。
+// fp = reverse(SHA1(serialize(modulus‖exponent))[-8:]) 的小写十六进制(16 字符, 用于与服务器返回指纹比对)。
+const MTPROTO_RSA_KEYS = [
+	{
+		fp: 'c3b42b026ce86b21',
+		modulusHex: 'c150023e2f70db7985ded064759cfecf0af328e69a41daf4d6f01b538135a6f91f8f8b2a0ec9ba9720ce352efcf6c5680ffc424bd634864902de0b4bd6d49f4e580230e3ae97d95c8b19442b3c0a10d8f5633fecedd6926a7f6dab0ddb7d457f9ea81b8465fcd6fffeed114011df91c059caedaf97625f6c96ecc74725556934ef781d866b34f011fce4d835a090196e9a5f0e4449af7eb697ddb9076494ca5f81104a305b6dd27665722c46b60e5df680fb16b210607ef217652e60236c255f6a28315f4083a96791d7214bf64c1df4fd0db1944fb26a2a57031b32eee64ad15a8ba68885cde74a5bfc920f6abf59ba5c75506373e7130f9042da922179251f',
+		exponentHex: '010001'
+	},
+	{
+		fp: '0bc35f3509f7b7a5',
+		modulusHex: 'aeec36c8ffc109cb099624685b97815415657bd76d8c9c3e398103d7ad16c9bba6f525ed0412d7ae2c2de2b44e77d72cbf4b7438709a4e646a05c43427c7f184debf72947519680e651500890c6832796dd11f772c25ff8f576755afe055b0a3752c696eb7d8da0d8be1faf38c9bdd97ce0a77d3916230c4032167100edd0f9e7a3a9b602d04367b689536af0d64b613ccba7962939d3b57682beb6dae5b608130b2e52aca78ba023cf6ce806b1dc49c72cf928a7199d22e3d7ac84e47bc9427d0236945d10dbd15177bab413fbf0edfda09f014c7a7da088dde9759702ca760af2b8e4e97cc055c617bd74c3d97008635b98dc4d621b4891da9fb0473047927',
+		exponentHex: '010001'
+	},
+	{
+		fp: '15ae5fa8b5529542',
+		modulusHex: 'bdf2c77d81f6afd47bd30f29ac76e55adfe70e487e5e48297e5a9055c9c07d2b93b4ed3994d3eca5098bf18d978d54f8b7c713eb10247607e69af9ef44f38e28f8b439f257a11572945cc0406fe3f37bb92b79112db69eedf2dc71584a661638ea5becb9e23585074b80d57d9f5710dd30d2da940e0ada2f1b878397dc1a72b5ce2531b6f7dd158e09c828d03450ca0ff8a174deacebcaa22dde84ef66ad370f259d18af806638012da0ca4a70baa83d9c158f3552bc9158e69bf332a45809e1c36905a5caa12348dd57941a482131be7b2355a5f4635374f3bd3ddf5ff925bf4809ee27c1e67d9120c5fe08a9de458b1b4a3c5d0a428437f2beca81f4e2d5ff',
+		exponentHex: '010001'
+	},
+	{
+		fp: 'aeae98e13cd7f94f',
+		modulusHex: 'b3f762b739be98f343eb1921cf0148cfa27ff7af02b6471213fed9daa0098976e667750324f1abcea4c31e43b7d11f1579133f2b3d9fe27474e462058884e5e1b123be9cbbc6a443b2925c08520e7325e6f1a6d50e117eb61ea49d2534c8bb4d2ae4153fabe832b9edf4c5755fdd8b19940b81d1d96cf433d19e6a22968a85dc80f0312f596bd2530c1cfb28b5fe019ac9bc25cd9c2a5d8a0f3a1c0c79bcca524d315b5e21b5c26b46babe3d75d06d1cd33329ec782a0f22891ed1db42a1d6c0dea431428bc4d7aabdcf3e0eb6fda4e23eb7733e7727e9a1915580796c55188d2596d2665ad1182ba7abf15aaa5a8b779ea996317a20ae044b820bff35b6e8a1',
+		exponentHex: '010001'
+	},
+	{
+		fp: '5a181b2235057d98',
+		modulusHex: 'be6a71558ee577ff03023cfa17aab4e6c86383cff8a7ad38edb9fafe6f323f2d5106cbc8cafb83b869cffd1ccf121cd743d509e589e68765c96601e813dc5b9dfc4be415c7a6526132d0035ca33d6d6075d4f535122a1cdfe017041f1088d1419f65c8e5490ee613e16dbf662698c0f54870f0475fa893fc41eb55b08ff1ac211bc045ded31be27d12c96d8d3cfc6a7ae8aa50bf2ee0f30ed507cc2581e3dec56de94f5dc0a7abee0be990b893f2887bd2c6310a1e0a9e3e38bd34fded2541508dc102a9c9b4c95effd9dd2dfe96c29be647d6c69d66ca500843cfaed6e440196f1dbe0e2e22163c61ca48c79116fa77216726749a976a1c4b0944b5121e8c01',
+		exponentHex: '010001'
+	}
+];
+
+// 固定 2048 位 dh_prime(官方常量, DH 参数校验用)。来源: @mtproto/core/src/rpc/index.js。
+const MTPROTO_DH_PRIME_HEX = 'c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b';
+
+// 错误分类枚举(供 mtpClassifyError 使用, 便于日志只打分类不打敏感上下文)。
+const MTPROTO_ERR = {
+	T_IMPORT: 'socket-import',
+	T_CONNECT: 'connect',
+	T_TIMEOUT: 'timeout',
+	T_PROTOCOL: 'protocol',
+	T_MIGRATE: 'migrate',
+	T_AUTH: 'auth',
+	T_RPC: 'rpc',
+	T_NOTADMIN: 'not-admin',
+	T_NOPART: 'not-participant'
+};
+
+// ---- 通用字节/大数工具 ----
+
+// Uint8Array → 小写十六进制字符串
+function mtpHex(bytes) {
+	let s = '';
+	for (let i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+	return s;
+}
+
+// 十六进制字符串 → Uint8Array; 传 length 时左侧补零到该字节数
+function mtpHexToBytes(hex, length) {
+	let h = String(hex || '');
+	if (h.length % 2) h = '0' + h;
+	const out = new Uint8Array(h.length / 2);
+	for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+	if (length && out.length < length) {
+		const padded = new Uint8Array(length);
+		padded.set(out, length - out.length);
+		return padded;
+	}
+	return out;
+}
+
+// 字节数组 → BigInt(大端)
+function mtpBytesToBigInt(bytes) {
+	let v = 0n;
+	for (let i = 0; i < bytes.length; i++) v = (v << 8n) | BigInt(bytes[i]);
+	return v;
+}
+
+// BigInt → 字节数组(大端); 传 length 时左侧补零到该字节数
+function mtpBigIntToBytes(value, length) {
+	let hex = BigInt(value).toString(16);
+	if (hex.length % 2) hex = '0' + hex;
+	return mtpHexToBytes(hex, length);
+}
+
+// BigInt → 小端字节序列(length 字节); 与 mtpReader.long()(小端读入)互逆。
+// 用于回写 wire 序的 long 字段(如 server_salt), 勿用于大端语义(g_b/auth_key)。
+function mtpLongToLeBytes(value, length) {
+	let x = BigInt.asUintN(64, BigInt(value));
+	const o = new Uint8Array(length || 8);
+	for (let i = 0; i < o.length; i++) { o[i] = Number(x & 0xffn); x >>= 8n; }
+	return o;
+}
+
+function mtpBytesEqual(a, b) {
+	if (!a || !b || a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+function mtpConcat() {
+	let length = 0;
+	for (let i = 0; i < arguments.length; i++) length += arguments[i].length;
+	const out = new Uint8Array(length);
+	let offset = 0;
+	for (let i = 0; i < arguments.length; i++) { out.set(arguments[i], offset); offset += arguments[i].length; }
+	return out;
+}
+
+function mtpXor(a, b) {
+	const out = new Uint8Array(a.length);
+	for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i];
+	return out;
+}
+
+function mtpRandom(n) {
+	const b = new Uint8Array(n);
+	crypto.getRandomValues(b);
+	return b;
+}
+
+// ---- 隔离域动态 import + 缓存 ----
+// 动态 import('cloudflare:sockets'); 成功缓存模块, 失败缓存 null。禁止静态 import。
+let mtpSocketsPromise = null;
+async function mtpGetSockets() {
+	if (!mtpSocketsPromise) {
+		mtpSocketsPromise = (async () => {
+			try {
+				const mod = await import('cloudflare:sockets');
+				return mod && typeof mod.connect === 'function' ? mod : null;
+			} catch (error) {
+				console.error('[MTProto] 动态 import cloudflare:sockets 失败:', error && error.message);
+				return null;
+			}
+		})();
+	}
+	return mtpSocketsPromise;
+}
+
+// 能力探测(同步): 有 D1 已就绪 + 有 KV。动态 import 的真正可用性由 await mtpGetSockets() 再确认。
+function mtpIsAvailable(env) {
+	return Boolean(env && env.KV && isDbReady(env));
+}
+
+// 给 promise 包一层超时。
+function mtpWithTimeout(promise, ms, label) {
+	let timer = null;
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => reject(new Error('timeout:' + label)), ms);
+	});
+	return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+// ---- 加密原语 ----
+async function mtpSha1(bytes) {
+	return new Uint8Array(await crypto.subtle.digest('SHA-1', bytes));
+}
+async function mtpSha256(bytes) {
+	return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+// gzip 解压(零依赖: DecompressionStream;不可用则视为不支持)
+async function mtpGunzip(bytes) {
+	if (typeof DecompressionStream !== 'function') throw new Error('no-decompression-stream');
+	const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+	const buf = await new Response(stream).arrayBuffer();
+	return new Uint8Array(buf);
+}
+
+// AES 分组密码(纯 JS, FIPS-197; 256-bit key)
+const MTPROTO_AES_SBOX = mtpHexToBytes(
+	'637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0' +
+	'b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275' +
+	'09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf' +
+	'd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2' +
+	'cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb' +
+	'e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08' +
+	'ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e' +
+	'e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16'
+);
+const MTPROTO_AES_INV_SBOX = mtpHexToBytes(
+	'52096ad53036a538bf40a39e81f3d7fb7ce339829b2fff87348e4344c4dee9cb' +
+	'547b9432a6c2233dee4c950b42fac34e082ea16628d924b2765ba2496d8bd125' +
+	'72f8f66486689816d4a45ccc5d65b6926c704850fdedb9da5e154657a78d9d84' +
+	'90d8ab008cbcd30af7e45805b8b34506d02c1e8fca3f0f02c1afbd0301138a6b' +
+	'3a9111414f67dcea97f2cfcef0b4e67396ac7422e7ad3585e2f937e81c75df6e' +
+	'47f11a711d29c5896fb7620eaa18be1bfc563e4bc6d279209adbc0fe78cd5af4' +
+	'1fdda8338807c731b11210592780ec5f60517fa919b54a0d2de57a9f93c99cef' +
+	'a0e03b4dae2af5b0c8ebbb3c83539961172b047eba77d626e169146355210c7d'
+);
+
+function mtpAesXt(v) { return ((v << 1) ^ ((v & 0x80) ? 0x1b : 0)) & 0xff; }
+
+function mtpAesGmul(a, b) {
+	let p = 0;
+	a &= 0xff; b &= 0xff;
+	for (let i = 0; i < 8; i++) {
+		if (b & 1) p ^= a;
+		const hi = a & 0x80;
+		a = (a << 1) & 0xff;
+		if (hi) a ^= 0x1b;
+		b >>= 1;
+	}
+	return p & 0xff;
+}
+
+// AES-256 密钥扩展: 32 字节 key → 240 字节轮密钥(Nr=14, 15 组 × 16)
+function mtpAesExpandKey(key) {
+	const w = new Uint8Array(240);
+	w.set(key.slice(0, 32));
+	let rcon = 1;
+	const temp = new Uint8Array(4);
+	for (let i = 32; i < w.length; i += 4) {
+		temp[0] = w[i - 4]; temp[1] = w[i - 3]; temp[2] = w[i - 2]; temp[3] = w[i - 1];
+		if (i % 32 === 0) {
+			const t = temp[0];
+			temp[0] = MTPROTO_AES_SBOX[temp[1]] ^ rcon;
+			temp[1] = MTPROTO_AES_SBOX[temp[2]];
+			temp[2] = MTPROTO_AES_SBOX[temp[3]];
+			temp[3] = MTPROTO_AES_SBOX[t];
+			rcon = mtpAesXt(rcon);
+		} else if (i % 32 === 16) {
+			temp[0] = MTPROTO_AES_SBOX[temp[0]];
+			temp[1] = MTPROTO_AES_SBOX[temp[1]];
+			temp[2] = MTPROTO_AES_SBOX[temp[2]];
+			temp[3] = MTPROTO_AES_SBOX[temp[3]];
+		}
+		w[i] = w[i - 32] ^ temp[0];
+		w[i + 1] = w[i - 31] ^ temp[1];
+		w[i + 2] = w[i - 30] ^ temp[2];
+		w[i + 3] = w[i - 29] ^ temp[3];
+	}
+	return w;
+}
+
+function mtpAesShiftRows(s) {
+	let t;
+	t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+	t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+	t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+}
+
+function mtpAesInvShiftRows(s) {
+	let t;
+	t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
+	t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+	t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t;
+}
+
+function mtpAesMixColumns(s) {
+	for (let c = 0; c < 4; c++) {
+		const i = c * 4;
+		const a0 = s[i], a1 = s[i + 1], a2 = s[i + 2], a3 = s[i + 3];
+		s[i] = mtpAesXt(a0) ^ (mtpAesXt(a1) ^ a1) ^ a2 ^ a3;
+		s[i + 1] = a0 ^ mtpAesXt(a1) ^ (mtpAesXt(a2) ^ a2) ^ a3;
+		s[i + 2] = a0 ^ a1 ^ mtpAesXt(a2) ^ (mtpAesXt(a3) ^ a3);
+		s[i + 3] = (mtpAesXt(a0) ^ a0) ^ a1 ^ a2 ^ mtpAesXt(a3);
+	}
+}
+
+function mtpAesInvMixColumns(s) {
+	for (let c = 0; c < 4; c++) {
+		const i = c * 4;
+		const a0 = s[i], a1 = s[i + 1], a2 = s[i + 2], a3 = s[i + 3];
+		s[i] = mtpAesGmul(a0, 14) ^ mtpAesGmul(a1, 11) ^ mtpAesGmul(a2, 13) ^ mtpAesGmul(a3, 9);
+		s[i + 1] = mtpAesGmul(a0, 9) ^ mtpAesGmul(a1, 14) ^ mtpAesGmul(a2, 11) ^ mtpAesGmul(a3, 13);
+		s[i + 2] = mtpAesGmul(a0, 13) ^ mtpAesGmul(a1, 9) ^ mtpAesGmul(a2, 14) ^ mtpAesGmul(a3, 11);
+		s[i + 3] = mtpAesGmul(a0, 11) ^ mtpAesGmul(a1, 13) ^ mtpAesGmul(a2, 9) ^ mtpAesGmul(a3, 14);
+	}
+}
+
+function mtpAesEncryptBlock(rk, input) {
+	const s = new Uint8Array(16);
+	for (let i = 0; i < 16; i++) s[i] = input[i] ^ rk[i];
+	for (let round = 1; round < 14; round++) {
+		for (let i = 0; i < 16; i++) s[i] = MTPROTO_AES_SBOX[s[i]];
+		mtpAesShiftRows(s);
+		mtpAesMixColumns(s);
+		const off = round * 16;
+		for (let i = 0; i < 16; i++) s[i] ^= rk[off + i];
+	}
+	for (let i = 0; i < 16; i++) s[i] = MTPROTO_AES_SBOX[s[i]];
+	mtpAesShiftRows(s);
+	for (let i = 0; i < 16; i++) s[i] ^= rk[14 * 16 + i];
+	return s;
+}
+
+function mtpAesDecryptBlock(rk, input) {
+	const s = new Uint8Array(16);
+	for (let i = 0; i < 16; i++) s[i] = input[i] ^ rk[14 * 16 + i];
+	for (let round = 13; round >= 1; round--) {
+		mtpAesInvShiftRows(s);
+		for (let i = 0; i < 16; i++) s[i] = MTPROTO_AES_INV_SBOX[s[i]];
+		const off = round * 16;
+		for (let i = 0; i < 16; i++) s[i] ^= rk[off + i];
+		mtpAesInvMixColumns(s);
+	}
+	mtpAesInvShiftRows(s);
+	for (let i = 0; i < 16; i++) s[i] = MTPROTO_AES_INV_SBOX[s[i]];
+	for (let i = 0; i < 16; i++) s[i] ^= rk[i];
+	return s;
+}
+
+// AES-256-IGE 加密/解密(key/iv 各 32 字节, 密文长度为 16 的整数倍)
+function mtpAesIgeEncrypt(key, iv, data) {
+	const rk = mtpAesExpandKey(key);
+	const out = new Uint8Array(data.length);
+	let ivp = iv.slice(0, 16);
+	let iv2p = iv.slice(16, 32);
+	const block = new Uint8Array(16);
+	for (let i = 0; i < data.length; i += 16) {
+		const nextIv2p = data.slice(i, i + 16);
+		for (let j = 0; j < 16; j++) block[j] = data[i + j] ^ ivp[j];
+		const enc = mtpAesEncryptBlock(rk, block);
+		for (let j = 0; j < 16; j++) out[i + j] = enc[j] ^ iv2p[j];
+		ivp = out.slice(i, i + 16);
+		iv2p = nextIv2p;
+	}
+	return out;
+}
+
+function mtpAesIgeDecrypt(key, iv, data) {
+	const rk = mtpAesExpandKey(key);
+	const out = new Uint8Array(data.length);
+	let ivp = iv.slice(0, 16);
+	let iv2p = iv.slice(16, 32);
+	const block = new Uint8Array(16);
+	for (let i = 0; i < data.length; i += 16) {
+		const nextIvp = data.slice(i, i + 16);
+		for (let j = 0; j < 16; j++) block[j] = data[i + j] ^ iv2p[j];
+		const dec = mtpAesDecryptBlock(rk, block);
+		for (let j = 0; j < 16; j++) out[i + j] = dec[j] ^ ivp[j];
+		ivp = nextIvp;
+		iv2p = out.slice(i, i + 16);
+	}
+	return out;
+}
+
+// RSA_PAD: 255 随机字节, 前 20 字节覆盖 SHA1(data), 紧随其后写入 data。返回 255 字节。
+async function mtpRsaPad(dataBytes) {
+	const out = mtpRandom(255);
+	const hash = await mtpSha1(dataBytes);
+	out.set(hash, 0);
+	out.set(dataBytes, hash.length);
+	return out;
+}
+
+// 大数模幂(平方-乘, 逐步取模; 不可用 ** 因为指数可达 256-bit)
+/** @param {bigint} base @param {bigint} exp @param {bigint} mod */
+function mtpModPow(base, exp, mod) {
+	let result = 1n;
+	let b = base % mod;
+	let e = exp;
+	while (e > 0n) {
+		if (e & 1n) result = (result * b) % mod;
+		e >>= 1n;
+		b = (b * b) % mod;
+	}
+	return result;
+}
+
+// D4 预留:把 exp 按 shardBits 从低位到高位分片推进模幂(默认不启用,仅保留 schema 兼容接口)。
+// 返回 { value, done, carryState }:carryState 可序列化后跨请求续算。
+function mtpModPowSharded(base, exp, mod, shardBits, carryState) {
+	const bits = BigInt(shardBits || 32);
+	const state = carryState && typeof carryState === 'object' ? carryState : {};
+	let acc = state.acc != null ? BigInt(state.acc) : 1n;
+	let b = state.b != null ? BigInt(state.b) : (BigInt(base) % BigInt(mod));
+	let processed = state.processed != null ? BigInt(state.processed) : 0n;
+	const total = BigInt(exp.toString(2).length);
+	let step = 0n;
+	while (processed + step < total && step < bits) {
+		const bit = (BigInt(exp) >> processed) & 1n;
+		if (bit) acc = (acc * b) % BigInt(mod);
+		b = (b * b) % BigInt(mod);
+		processed += 1n;
+		step += 1n;
+	}
+	const done = processed >= total;
+	return { value: acc, done, carryState: done ? null : { acc: acc.toString(), b: b.toString(), processed: processed.toString() } };
+}
+
+function mtpGcd(a, b) {
+	while (b !== 0n) { const t = a % b; a = b; b = t; }
+	return a;
+}
+
+// Pollard-Brent rho 分解 63-bit 合数 pq → 两个质因子(小者在前)
+/** @param {bigint} n @param {bigint} c */
+function mtpPollardBrent(n, c) {
+	if (n % 2n === 0n) return 2n;
+	let y = 2n, r = 1, q = 1n, g = 1n, x = 0n, ys = 0n;
+	const m = 128;
+	while (g === 1n) {
+		x = y;
+		for (let i = 0; i < r; i++) y = (y * y + c) % n;
+		let k = 0;
+		while (k < r && g === 1n) {
+			ys = y;
+			const lim = Math.min(m, r - k);
+			for (let i = 0; i < lim; i++) {
+				y = (y * y + c) % n;
+				const diff = x > y ? x - y : y - x;
+				q = (q * diff) % n;
+			}
+			g = mtpGcd(q, n);
+			k += m;
+		}
+		r <<= 1;
+		if (r > (1 << 20)) break;
+	}
+	if (g === n) {
+		g = 1n;
+		while (g === 1n) {
+			ys = (ys * ys + c) % n;
+			const diff = x > ys ? x - ys : ys - x;
+			g = mtpGcd(diff, n);
+		}
+	}
+	return g;
+}
+
+function mtpFactorizePq(pqBytes) {
+	const n = mtpBytesToBigInt(pqBytes);
+	if (n <= 1n) throw new Error('bad-pq');
+	const smallPrimes = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n, 41n, 43n, 47n, 53n, 59n, 61n, 67n, 71n, 73n, 79n, 83n, 89n, 97n];
+	for (const p of smallPrimes) {
+		if (n % p === 0n) {
+			const q = n / p;
+			return p <= q ? [mtpBigIntToBytes(p), mtpBigIntToBytes(q)] : [mtpBigIntToBytes(q), mtpBigIntToBytes(p)];
+		}
+	}
+	for (let c = 1n; c <= 40n; c++) {
+		const d = mtpPollardBrent(n, c);
+		if (d > 1n && d < n) {
+			const e = n / d;
+			return d <= e ? [mtpBigIntToBytes(d), mtpBigIntToBytes(e)] : [mtpBigIntToBytes(e), mtpBigIntToBytes(d)];
+		}
+	}
+	throw new Error('factor-failed');
+}
+
+// 按服务器返回指纹列表挑选 RSA 公钥(指纹统一规范化为 16 字符十六进制比对)
+function mtpFindRsaKey(fingerprints) {
+	for (const fp of fingerprints) {
+		const hex = fp.toString(16).padStart(16, '0');
+		const found = MTPROTO_RSA_KEYS.find((k) => k.fp === hex);
+		if (found) return found;
+	}
+	return null;
+}
+
+// RSA 加密: c = m^e mod n → 256 字节
+function mtpRsaEncrypt(key, paddedBytes) {
+	const m = mtpBytesToBigInt(paddedBytes);
+	const e = BigInt('0x' + key.exponentHex);
+	const n = BigInt('0x' + key.modulusHex);
+	return mtpBigIntToBytes(mtpModPow(m, e, n), 256);
+}
+
+// ---- TL 编码 ----
+// 小端 writer,支持 TL 原语与 length-prefixed bytes/string。
+function mtpWriter() {
+	const arr = [];
+	const enc = new TextEncoder();
+	const api = {
+		i32(v) { arr.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff); return api; },
+		u32(v) { return api.i32(v | 0); },
+		long(v) {
+			let x = BigInt.asUintN(64, BigInt(v));
+			for (let i = 0; i < 8; i++) { arr.push(Number(x & 0xffn)); x >>= 8n; }
+			return api;
+		},
+		raw(u8) { for (let i = 0; i < u8.length; i++) arr.push(u8[i] & 0xff); return api; },
+		bytes(u8) {
+			const n = u8.length;
+			if (n <= 253) arr.push(n);
+			else arr.push(254, n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff);
+			api.raw(u8);
+			while (arr.length % 4 !== 0) arr.push(0);
+			return api;
+		},
+		str(s) { return api.bytes(enc.encode(s)); },
+		toBytes() { return Uint8Array.from(arr); }
+	};
+	return api;
+}
+
+// 序列化握手段(明文)构造器。
+function mtpSerialize(name, params) {
+	const w = mtpWriter();
+	switch (name) {
+		case 'req_pq_multi':
+			w.u32(0xbe7e8ef1).raw(params.nonce);
+			break;
+		case 'p_q_inner_data':
+			w.u32(0x83c95aec).bytes(params.pq).bytes(params.p).bytes(params.q).raw(params.nonce).raw(params.server_nonce).raw(params.new_nonce);
+			break;
+		case 'p_q_inner_data_dc':
+			w.u32(0xa9f55f95).bytes(params.pq).bytes(params.p).bytes(params.q).raw(params.nonce).raw(params.server_nonce).raw(params.new_nonce).i32(params.dc);
+			break;
+		case 'req_DH_params':
+			w.u32(0xd712e4be).raw(params.nonce).raw(params.server_nonce).bytes(params.p).bytes(params.q).long(params.public_key_fingerprint).bytes(params.encrypted_data);
+			break;
+		case 'set_client_DH_params':
+			w.u32(0xf5045f1f).raw(params.nonce).raw(params.server_nonce).bytes(params.encrypted_data);
+			break;
+		case 'client_DH_inner_data':
+			w.u32(0x6643b654).raw(params.nonce).raw(params.server_nonce).long(params.retry_id).bytes(params.g_b);
+			break;
+		case 'invokeWithLayer':
+			w.u32(0xda9b0d0d).i32(params.layer).raw(params.query);
+			break;
+		default:
+			throw new Error('unsupported-serialize:' + name);
+	}
+	return w.toBytes();
+}
+
+// 序列化加密段方法查询(作为 invokeWithLayer/initConnection 的 query)。
+function mtpSerMethod(name, params) {
+	const w = mtpWriter();
+	switch (name) {
+		case 'help.getConfig':
+			w.u32(0xc4f9186b);
+			break;
+		case 'auth.importBotAuthorization':
+			w.u32(0x67a3ff2c).i32(0).i32(params.api_id).str(params.api_hash).str(params.bot_auth_token);
+			break;
+		case 'channels.getChannels':
+			// 用零 hash 的 inputChannel 解析超级群真实 access_hash(实测:bot 传零 hash 被接受并回真值)。
+			w.u32(0x0a7f6bbb)
+				.u32(0x1cb5c415).i32(1)                              // Vector<InputChannel>, 长度 1
+				.u32(0xf35aec28).long(params.channel_id).long(0n);   // inputChannel(channel_id, 0)
+			break;
+		case 'channels.getParticipant':
+			// channel 侧必须带真实 access_hash(零 hash 会被服务器以 CHANNEL_INVALID 拒绝)。
+			// user 侧保持零 hash(实测 bot 传零 hash 被接受, 无需解析 user hash)。
+			w.u32(0xa0ab6cc6)
+				.u32(0xf35aec28).long(params.channel_id).long(params.channel_hash != null ? params.channel_hash : 0n) // inputChannel(真 hash)
+				.u32(0xdde8a54c).long(params.user_id).long(0n);      // inputPeerUser(id, 0)
+			break;
+		default:
+			throw new Error('unsupported-method:' + name);
+	}
+	return w.toBytes();
+}
+
+// initConnection 包装(flags=0, 无 proxy/params)
+function mtpSerInitConnection(apiId, queryBytes) {
+	const w = mtpWriter();
+	w.u32(0xc1cd5ea9);
+	w.i32(0);
+	w.i32(apiId);
+	w.str('CF-TGUnbanBot');
+	w.str('1.0.0');
+	w.str('1.0.0');
+	w.str('zh');
+	w.str('');
+	w.str('zh');
+	w.raw(queryBytes);
+	return w.toBytes();
+}
+
+// ---- TL 解码 ----
+function mtpReader(bytes) {
+	let o = 0;
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const api = {
+		get offset() { return o; },
+		u8() { return bytes[o++]; },
+		i32() { const v = dv.getInt32(o, true); o += 4; return v; },
+		u32() { const v = dv.getUint32(o, true); o += 4; return v; },
+		long() {
+			let v = 0n;
+			for (let i = 0; i < 8; i++) v |= BigInt(bytes[o + i]) << BigInt(8 * i);
+			o += 8;
+			return v;
+		},
+		int128() { const r = bytes.slice(o, o + 16); o += 16; return r; },
+		int256() { const r = bytes.slice(o, o + 32); o += 32; return r; },
+		bytes() {
+			let n = bytes[o++];
+			if (n === 254) { n = bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16); o += 3; }
+			const r = bytes.slice(o, o + n);
+			o += n;
+			while (o % 4 !== 0) o++;
+			return r;
+		},
+		str() { return new TextDecoder().decode(api.bytes()); },
+		vec(fn) {
+			api.u32(); // 构造器 id 0x1cb5c415
+			const n = api.i32();
+			const list = [];
+			for (let i = 0; i < n; i++) list.push(fn(api));
+			return list;
+		},
+		take(n) { const r = bytes.slice(o, o + n); return r; },
+		skip(n) { o += n; },
+		predicate() { const id = api.u32(); return mtpParseCtor(api, id); }
+	};
+	return api;
+}
+
+// 递归解析服务端构造器(最小集;未知构造器返回占位并不再消费后续字节)。
+function mtpParseCtor(r, id) {
+	switch (id) {
+		case 0x05162463: // resPQ
+			return { _: 'resPQ', nonce: r.int128(), server_nonce: r.int128(), pq: r.bytes(), fingerprints: r.vec((x) => x.long()) };
+		case 0x79cb045d: // server_DH_params_fail
+			return { _: 'server_DH_params_fail', nonce: r.int128(), server_nonce: r.int128(), new_nonce_hash: r.int128() };
+		case 0xd0e8075c: // server_DH_params_ok
+			return { _: 'server_DH_params_ok', nonce: r.int128(), server_nonce: r.int128(), encrypted_answer: r.bytes() };
+		case 0xb5890dba: // server_DH_inner_data
+			return { _: 'server_DH_inner_data', nonce: r.int128(), server_nonce: r.int128(), g: r.i32(), dh_prime: r.bytes(), g_a: r.bytes(), server_time: r.i32() };
+		case 0x3bcbf734: // dh_gen_ok
+			return { _: 'dh_gen_ok', nonce: r.int128(), server_nonce: r.int128(), new_nonce_hash1: r.int128() };
+		case 0x46dc1fb9: // dh_gen_retry
+			return { _: 'dh_gen_retry', nonce: r.int128(), server_nonce: r.int128(), new_nonce_hash2: r.int128() };
+		case 0xa69dae02: // dh_gen_fail
+			return { _: 'dh_gen_fail', nonce: r.int128(), server_nonce: r.int128(), new_nonce_hash3: r.int128() };
+		case 0xf35c6d01: // rpc_result
+			return { _: 'rpc_result', req_msg_id: r.long(), result: r.predicate() };
+		case 0x2144ca19: // rpc_error
+			return { _: 'rpc_error', error_code: r.i32(), error_message: r.str() };
+		case 0x9ec20908: // new_session_created
+			return { _: 'new_session_created', first_msg_id: r.long(), unique_id: r.long(), server_salt: r.long() };
+		case 0x73f1f8dc: { // msg_container
+			const n = r.i32();
+			const messages = [];
+			for (let i = 0; i < n; i++) {
+				const msgId = r.long();
+				const seqNo = r.i32();
+				const len = r.i32();
+				const body = r.take(len);
+				r.skip(len);
+				const sub = mtpReader(body);
+				const parsed = mtpParseCtor(sub, sub.u32());
+				messages.push({ _: 'message', msg_id: msgId, seqno: seqNo, body: parsed });
+			}
+			return { _: 'msg_container', messages };
+		}
+		case 0x3072cfa1: // gzip_packed
+			return { _: 'gzip_packed', packed_data: r.bytes() };
+		case 0xedab447b: // bad_server_salt
+			return { _: 'bad_server_salt', bad_msg_id: r.long(), bad_msg_seqno: r.i32(), error_code: r.i32(), new_server_salt: r.long() };
+		case 0xa7eff811: // bad_msg_notification
+			return { _: 'bad_msg_notification', bad_msg_id: r.long(), bad_msg_seqno: r.i32(), error_code: r.i32() };
+		case 0x62d6b459: // msgs_ack
+			return { _: 'msgs_ack', msg_ids: r.vec((x) => x.long()) };
+		case 0x347773c5: // pong
+			return { _: 'pong', msg_id: r.long(), ping_id: r.long() };
+		case 0xdfb80317: // channels.channelParticipant : 只取 participant,不解析 chats/users
+			return { _: 'channels.channelParticipant', participant: r.predicate() };
+		case 0xc00c07c0: // channelParticipant
+			return { _: 'channelParticipant', user_id: r.long(), date: r.i32() };
+		case 900251559: // channelParticipantSelf
+			return { _: 'channelParticipantSelf', flags: r.i32(), user_id: r.long(), inviter_id: r.long(), date: r.i32() };
+		case 803602899: // channelParticipantCreator(无 date)
+			return { _: 'channelParticipantCreator', flags: r.i32(), user_id: r.long() };
+		case 885242707: { // channelParticipantAdmin
+			// 参考库: flags.can_edit=bit0, flags.self=bit1, inviter_id 条件位 = flags&2(bit1,即 self)。
+			const flags = r.i32();
+			const userId = r.long();
+			if (flags & 2) r.long(); // inviter_id(可选, 条件位 self=flags&2)
+			const promotedBy = r.long();
+			const date = r.i32();
+			return { _: 'channelParticipantAdmin', user_id: userId, promoted_by: promotedBy, date };
+		}
+		// ---- Peer predicate(消费字节; 供 channelParticipantBanned.kicked 的 peer 字段解析) ----
+		case 1498486562: // peerUser#59511722
+			return { _: 'peerUser', user_id: r.long() };
+		case 918946202: // peerChat#36c6019a
+			return { _: 'peerChat', chat_id: r.long() };
+		case 2728736542: // peerChannel#a2a5371e
+			return { _: 'peerChannel', channel_id: r.long() };
+		case 1844969806: // channelParticipantBanned#6df8014e(旧版, 无 rank)
+		case 3589320081: { // channelParticipantBanned#d5f0ad91(新版, rank:flags.2?string 位于末尾, 不影响 date 位置)
+			// schema: flags:int → peer:Peer → kicked_by:long → date:int → banned_rights → rank
+			// D6 修订(2025-10): date 官方语义 = "When did the user join the group" → 采用为入群时间;
+			// 沿用"读所需即止"模式, 不读取 date 之后的条件字段(banned_rights/rank)。
+			const flags = r.i32();
+			const peer = r.predicate();
+			const kicked_by = r.long();
+			const date = r.i32();
+			return { _: 'channelParticipantBanned', flags, left: Boolean(flags & 1), peer, kicked_by, date };
+		}
+		case 782418132: // auth.authorization
+			return { _: 'auth.authorization' };
+		case 0x64ff9fd5: // messages.chats
+			return { _: 'messages.chats', chats: r.vec(() => r.predicate()) };
+		case 0x9cd81144: // messages.chatsSlice(count:int, chats:Vector<Chat>) → 统一为 messages.chats
+			r.i32(); // 跳过 count
+			return { _: 'messages.chats', chats: r.vec(() => r.predicate()) };
+		case 0x83259464: { // channel: 仅取 id/access_hash(注意 flags 与 id 之间还有一个 flags2:int)
+			const flags = r.i32();
+			r.i32(); // flags2
+			const id = r.long();
+			const access_hash = (flags & 0x2000) ? r.long() : null; // access_hash 条件位 bit13
+			return { _: 'channel', id, access_hash };
+		}
+		default:
+			return { _: 'unsupported', id };
+	}
+}
+
+// ---- 传输层 ----
+// 从 socket readable 的 reader 构造带缓冲的字节读取器。
+function mtpSocketReader(reader) {
+	let buf = new Uint8Array(0);
+	return {
+		async read(n) {
+			while (buf.length < n) {
+				const { value, done } = await reader.read();
+				if (done) throw new Error('socket-closed');
+				buf = mtpConcat(buf, value);
+			}
+			const out = buf.slice(0, n);
+			buf = buf.slice(n);
+			return out;
+		}
+	};
+}
+
+// intermediate 传输帧: 首包前置 4 字节 0xEEEEEEEE, 每包 [len:u32 LE][payload]
+function mtpFrame(payload, isFirst) {
+	const w = mtpWriter();
+	if (isFirst) w.u32(0xeeeeeeee);
+	w.i32(payload.length);
+	w.raw(payload);
+	return w.toBytes();
+}
+
+async function mtpConnect(dc) {
+	const sockets = await mtpGetSockets();
+	if (!sockets) throw new Error('no-sockets');
+	const socket = sockets.connect({ hostname: dc.host, port: dc.port });
+	await mtpWithTimeout(socket.opened, MTPROTO_ROUND_TIMEOUT_MS, 'connect');
+	const writer = socket.writable.getWriter();
+	const sr = mtpSocketReader(socket.readable.getReader());
+	return { socket, writer, sr, dcId: dc.id, firstSend: true, seqNo: 0, lastMessageId: 0n, timeOffset: 0 };
+}
+
+// 读取一个 intermediate 帧([len][payload])
+async function mtpReadFrame(ctx, timeoutMs) {
+	const header = await mtpWithTimeout(ctx.sr.read(4), timeoutMs || MTPROTO_ROUND_TIMEOUT_MS, 'read-header');
+	const len = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, true);
+	if (len === 0) return new Uint8Array(0);
+	return await mtpWithTimeout(ctx.sr.read(len), timeoutMs || MTPROTO_ROUND_TIMEOUT_MS, 'read-body');
+}
+
+// msg_id: 64-bit = (timeSec << 32) | (ms<<21 | rnd<<3 | 4), 保证单调递增
+function mtpMsgId(ctx) {
+	const now = Date.now();
+	const timeSec = Math.floor(now / 1000) + (ctx.timeOffset || 0);
+	const timeMSec = now % 1000;
+	const rnd = Math.floor(Math.random() * 0xffff);
+	let id = (BigInt(timeSec) << 32n) | (BigInt((timeMSec << 21) | (rnd << 3) | 4) & 0xffffffffn);
+	if (id <= ctx.lastMessageId) id = ctx.lastMessageId + 4n;
+	ctx.lastMessageId = id;
+	return id;
+}
+
+// seq_no: content 相关 +1 并自增
+// 注: 早期实现按"连接级 ctx.seqNo"计数, 新连接会归零导致同 session_id 的 seq 回退(服务器回 bad_msg_notification 32)。
+// 发送路径已改为会话级 mtpTakeSeqNo(session); 此函数仅为兼容保留(QA 引用), 不再用于发送。
+function mtpSeqNo(ctx, contentRelated) {
+	let seqNo = ctx.seqNo * 2;
+	if (contentRelated) { seqNo += 1; ctx.seqNo += 1; }
+	return seqNo;
+}
+
+// 会话级 seq_no 归号(per-session 单调)。content 消息: 线路 seq = used*2+1, 且"发送即占号"(消息可能已达服务器, 绝不回退)。
+// 非 content(ack 等): seq = used*2, 不占用计数。返回值即写入线路的 seq_no(int32)。
+// seqNo 异常(非整数/负)按 0 兜底, 不抛错(SCHEMA 校验会拦正常路径, 探针/边界仍可能构造)。
+function mtpTakeSeqNo(session, contentRelated) {
+	const used = Number.isInteger(session.seqNo) && session.seqNo >= 0 ? session.seqNo : 0;
+	if (contentRelated) {
+		session.seqNo = used + 1; // 占号: 无论后续成败都不回退
+		return used * 2 + 1;
+	}
+	session.seqNo = used;
+	return used * 2;
+}
+
+// 明文消息: auth_key_id(8=0) + msg_id(8) + msg_len(4) + payload
+async function mtpSendPlain(ctx, payload) {
+	const msgId = mtpMsgId(ctx);
+	const w = mtpWriter();
+	w.long(0n).long(msgId).i32(payload.length).raw(payload);
+	await mtpWithTimeout(ctx.writer.write(mtpFrame(w.toBytes(), ctx.firstSend)), MTPROTO_ROUND_TIMEOUT_MS, 'write');
+	ctx.firstSend = false;
+	return msgId;
+}
+
+// 从 auth_key + msg_key 推导 AES-IGE key/iv
+async function mtpAesKeyIv(authKey, messageKey, isServer) {
+	const x = isServer ? 8 : 0;
+	const sha256a = await mtpSha256(mtpConcat(messageKey, authKey.slice(x, 36 + x)));
+	const sha256b = await mtpSha256(mtpConcat(authKey.slice(40 + x, 76 + x), messageKey));
+	const key = mtpConcat(sha256a.slice(0, 8), sha256b.slice(8, 24), sha256a.slice(24, 32));
+	const iv = mtpConcat(sha256b.slice(0, 8), sha256a.slice(8, 24), sha256b.slice(24, 32));
+	return { key, iv };
+}
+
+// 加密消息: auth_key_id + msg_key + AES-IGE(salt‖session_id‖msg_id‖seq_no‖len‖data‖padding)
+async function mtpSendEncrypted(ctx, session, data, contentRelated = true) {
+	const authKey = session.authKey;
+	const msgId = mtpMsgId(ctx);
+	const seqNo = mtpTakeSeqNo(session, contentRelated);
+	const minPadding = 12;
+	const unpadded = (32 + data.length + minPadding) % 16;
+	const padding = minPadding + (unpadded ? 16 - unpadded : 0);
+	const w = mtpWriter();
+	w.raw(session.serverSalt).raw(session.sessionId).long(msgId).i32(seqNo).i32(data.length).raw(data).raw(mtpRandom(padding));
+	const plain = w.toBytes();
+	const messageKey = (await mtpSha256(mtpConcat(authKey.slice(88, 120), plain))).slice(8, 24);
+	const { key, iv } = await mtpAesKeyIv(authKey, messageKey, false);
+	const encrypted = mtpAesIgeEncrypt(key, iv, plain);
+	const authKeyId = (await mtpSha1(authKey)).slice(-8);
+	await mtpWithTimeout(ctx.writer.write(mtpFrame(mtpConcat(authKeyId, messageKey, encrypted), ctx.firstSend)), MTPROTO_ROUND_TIMEOUT_MS, 'write');
+	ctx.firstSend = false;
+	return msgId;
+}
+
+// 读取并解密一帧(明文段) → 解析构造器
+async function mtpReadPlain(ctx, timeoutMs) {
+	const frame = await mtpReadFrame(ctx, timeoutMs);
+	const r = mtpReader(frame);
+	r.long(); r.long(); r.i32(); // auth_key_id, msg_id, msg_len
+	return mtpParseCtor(r, r.u32());
+}
+
+// 读取并解密一帧(加密段) → 解析顶层构造器(校验 msg_key)
+async function mtpReadEncrypted(ctx, session, timeoutMs) {
+	const frame = await mtpReadFrame(ctx, timeoutMs);
+	const authKey = session.authKey;
+	const msgKey = frame.slice(8, 24);
+	const encrypted = frame.slice(24);
+	const { key, iv } = await mtpAesKeyIv(authKey, msgKey, true);
+	const plain = mtpAesIgeDecrypt(key, iv, encrypted);
+	const computed = (await mtpSha256(mtpConcat(authKey.slice(96, 128), plain))).slice(8, 24);
+	if (!mtpBytesEqual(computed, msgKey)) {
+		console.error('[MTProto] 加密消息 msg_key 校验失败(已忽略该帧)');
+		return null;
+	}
+	const r = mtpReader(plain);
+	r.long(); r.long(); r.long(); r.i32(); // salt, session_id, msg_id, seq_no
+	const length = r.i32();
+	const body = r.take(length);
+	const sub = mtpReader(body);
+	return mtpParseCtor(sub, sub.u32());
+}
+
+// 处理一条加密段顶层消息(含容器递归), 直到拿到匹配 reqMsgId 的 rpc_result。
+// 返回: { done, result?, badSalt?, newSalt? }
+async function mtpDispatchMessage(ctx, session, msg, reqMsgId) {
+	if (!msg) return { done: false };
+	if (msg._ === 'msg_container') {
+		for (const m of msg.messages) {
+			const res = await mtpDispatchMessage(ctx, session, m.body, reqMsgId);
+			if (res.done) return res;
+		}
+		return { done: false };
+	}
+	if (msg._ === 'gzip_packed') {
+		const inner = await mtpUnwrapGzip(msg);
+		return await mtpDispatchMessage(ctx, session, inner, reqMsgId);
+	}
+	if (msg._ === 'new_session_created') {
+		if (msg.server_salt != null) session.serverSalt = mtpLongToLeBytes(msg.server_salt, 8); // wire 序(小端), 勿用大端
+		return { done: false };
+	}
+	if (msg._ === 'bad_server_salt') {
+		if (reqMsgId != null && msg.bad_msg_id === reqMsgId) {
+			return { done: true, badSalt: true, newSalt: mtpLongToLeBytes(msg.new_server_salt, 8) }; // wire 序(小端), 勿用大端
+		}
+		return { done: false };
+	}
+	if (msg._ === 'bad_msg_notification') {
+		// 可观测性提升: 不再静默丢弃(此前 seq 回退/其它告警不可见)。最小变更, 不自动重建。
+		console.error('[MTProto] bad_msg_notification: code=' + msg.error_code + ', bad_msg_id=' + (msg.bad_msg_id != null ? msg.bad_msg_id.toString(16) : 'null'));
+		return { done: false };
+	}
+	if (msg._ === 'msgs_ack') return { done: false };
+	if (msg._ === 'rpc_result') {
+		if (reqMsgId == null || msg.req_msg_id === reqMsgId) {
+			let result = msg.result;
+			if (result && result._ === 'gzip_packed') result = await mtpUnwrapGzip(result);
+			return { done: true, result };
+		}
+		return { done: false };
+	}
+	return { done: false };
+}
+
+// 解压 gzip_packed 并解析内层构造器
+async function mtpUnwrapGzip(msg) {
+	try {
+		const bytes = await mtpGunzip(msg.packed_data);
+		const sub = mtpReader(bytes);
+		return mtpParseCtor(sub, sub.u32());
+	} catch (error) {
+		console.error('[MTProto] gzip 解压失败(已忽略):', error && error.message);
+		return { _: 'unsupported', id: 0 };
+	}
+}
+
+async function mtpWaitResult(ctx, session, reqMsgId, timeoutMs) {
+	const deadline = Date.now() + (timeoutMs || MTPROTO_ROUND_TIMEOUT_MS);
+	while (Date.now() < deadline) {
+		let msg;
+		try {
+			msg = await mtpReadEncrypted(ctx, session, Math.max(500, deadline - Date.now()));
+		} catch (error) {
+			if (String(error && error.message).startsWith('timeout:')) return { done: true, timeout: true };
+			throw error;
+		}
+		const res = await mtpDispatchMessage(ctx, session, msg, reqMsgId);
+		if (res.done) return res;
+	}
+	return { done: true, timeout: true };
+}
+
+// 发起一次加密 RPC(自动包裹 invokeWithLayer(initConnection(...)));bad_server_salt 时用新 salt 重发一次。
+async function mtpRpcCall(ctx, session, queryBytes, timeoutMs) {
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const initConn = mtpSerInitConnection(TG_API_ID, queryBytes);
+		const payload = mtpSerialize('invokeWithLayer', { layer: MTPROTO_LAYER, query: initConn });
+		const reqMsgId = await mtpSendEncrypted(ctx, session, payload, true);
+		const res = await mtpWaitResult(ctx, session, reqMsgId, timeoutMs);
+		if (res.badSalt && res.newSalt) { session.serverSalt = res.newSalt; continue; }
+		if (res.timeout) return { ok: false, kind: MTPROTO_ERR.T_TIMEOUT };
+		const r = res.result;
+		if (r && r._ === 'rpc_error') {
+			const cls = mtpClassifyError({ error_message: r.error_message, error_code: r.error_code });
+			return { ok: false, kind: cls.kind, nextDcId: cls.dcId, error: r };
+		}
+		return { ok: true, result: r };
+	}
+	return { ok: false, kind: MTPROTO_ERR.T_TIMEOUT };
+}
+
+// ---- 错误分类 ----
+function mtpClassifyError(err) {
+	const msg = String((err && (err.error_message || err.message)) || err || '');
+	const migrate = msg.match(/(?:PHONE|NETWORK|USER|FILE|DC)_MIGRATE_(\d+)/);
+	if (migrate) return { kind: MTPROTO_ERR.T_MIGRATE, dcId: parseInt(migrate[1], 10) };
+	if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|AUTH_KEY_INVALID|AUTH_KEY_DUPLICATED|USER_DEACTIVATED|AUTH_KEY_PERM_EMPTY/.test(msg)) return { kind: MTPROTO_ERR.T_AUTH };
+	if (/CHAT_ADMIN_REQUIRED|CHAT_WRITE_FORBIDDEN/.test(msg)) return { kind: MTPROTO_ERR.T_NOTADMIN };
+	if (/USER_NOT_PARTICIPANT|PARTICIPANT_ID_INVALID|CHANNEL_INVALID|PEER_ID_INVALID|CHANNEL_PRIVATE/.test(msg)) return { kind: MTPROTO_ERR.T_NOPART };
+	if (/timeout:/.test(msg)) return { kind: MTPROTO_ERR.T_TIMEOUT };
+	if (/socket|connect|network|closed/i.test(msg)) return { kind: MTPROTO_ERR.T_CONNECT };
+	return { kind: MTPROTO_ERR.T_RPC };
+}
+
+// ---- 握手状态 KV ----
+async function mtpKvGet(env, key) {
+	try {
+		const raw = await env.KV.get(key);
+		return raw ? JSON.parse(raw) : null;
+	} catch (_) { return null; }
+}
+async function mtpKvPut(env, key, obj) {
+	try { await env.KV.put(key, JSON.stringify(obj)); return true; }
+	catch (error) { console.error('[MTProto] KV 写入失败:', error && error.message); return false; }
+}
+async function mtpKvDel(env, key) {
+	try { await env.KV.delete(key); return true; }
+	catch (error) { console.error('[MTProto] KV 删除失败:', error && error.message); return false; }
+}
+
+async function mtpLoadHandshake(env) {
+	const st = await mtpKvGet(env, MTPROTO_KV_HANDSHAKE);
+	if (!st || st.v !== MTPROTO_SCHEMA_V || !st.stage) {
+		if (st) await mtpKvDel(env, MTPROTO_KV_HANDSHAKE); // 状态损坏 → 安全清空
+		return null;
+	}
+	return st;
+}
+async function mtpSaveHandshake(env, st) { return mtpKvPut(env, MTPROTO_KV_HANDSHAKE, st); }
+async function mtpClearHandshake(env) { return mtpKvDel(env, MTPROTO_KV_HANDSHAKE); }
+
+async function mtpLoadSession(env) {
+	const st = await mtpKvGet(env, MTPROTO_KV_SESSION);
+	// 完整校验: 版本/凭据/会话级 seqNo 计数任一缺失 → 结构损坏, 安全清空重建。
+	// (线上旧 v1 会话含被污染的 server_salt, 且缺 seqNo, 借此 + 版本不符一并清除)
+	if (!st || st.v !== MTPROTO_SCHEMA_V || !st.authKey || !Number.isInteger(st.seqNo)) {
+		if (st) await mtpKvDel(env, MTPROTO_KV_SESSION);
+		return null;
+	}
+	return st;
+}
+async function mtpSaveSession(env, st) { return mtpKvPut(env, MTPROTO_KV_SESSION, st); }
+async function mtpClearSession(env) { return mtpKvDel(env, MTPROTO_KV_SESSION); }
+
+// 构建可持久化的 session 记录: 密钥材料转十六进制; 含会话级 seqNo 延续计数。
+// existing 存在时保留其 createdAt/lastQueryFailedAt; 否则用当前时间。
+function mtpSessionRecord(session, dcId, tokenFp, existing) {
+	const nowSec = Math.floor(Date.now() / 1000);
+	return {
+		v: MTPROTO_SCHEMA_V,
+		dcId: dcId,
+		authKey: mtpHex(session.authKey),
+		serverSalt: mtpHex(session.serverSalt),
+		sessionId: mtpHex(session.sessionId),
+		timeOffset: session.timeOffset || 0,
+		seqNo: Number.isInteger(session.seqNo) && session.seqNo >= 0 ? session.seqNo : 0,
+		channelCacheId: session.channelCacheId || '',
+		channelCacheHash: session.channelCacheHash || '',
+		tokenFp: tokenFp,
+		createdAt: (existing && existing.createdAt) || nowSec,
+		lastUsedAt: nowSec,
+		lastQueryFailedAt: (existing && existing.lastQueryFailedAt) || 0
+	};
+}
+
+// 失败计数/冷却(≤3 次后冷却 10 分钟)
+async function mtpBumpFailure(env) {
+	try {
+		const st = (await mtpKvGet(env, MTPROTO_KV_HANDSHAKE)) || { v: MTPROTO_SCHEMA_V, stage: 'failed', failCount: 0, cooldownUntil: 0 };
+		st.failCount = (st.failCount || 0) + 1;
+		if (st.failCount >= MTPROTO_MAX_ATTEMPTS) {
+			st.stage = 'cooldown';
+			st.cooldownUntil = Math.floor(Date.now() / 1000) + MTPROTO_COOLDOWN_SECONDS;
+		}
+		await mtpSaveHandshake(env, st);
+	} catch (error) {
+		console.error('[MTProto] 记录握手失败计数异常:', error && error.message);
+	}
+}
+
+// token/api 指纹(sha256(bot_token‖api_id‖api_hash)[:8] 十六进制),不落明文。
+async function mtpTokenFingerprint(env) {
+	const seed = `${BOT_TOKEN || ''}|${TG_API_ID || ''}|${TG_API_HASH || ''}`;
+	const hash = await mtpSha256(new TextEncoder().encode(seed));
+	return mtpHex(hash.slice(0, 8));
+}
+
+async function mtpVerifyGenOk(newNonce, auxHash, genOkHash1) {
+	const check = (await mtpSha1(mtpConcat(newNonce, new Uint8Array([1]), auxHash))).slice(4, 20);
+	return mtpBytesEqual(check, genOkHash1);
+}
+
+// 校验服务器 DH 参数(g=3; dh_prime 等于固定常量; 1 < g_a < p-1 且 g_a ≥ 2^(2048-64) 且 g_a < p-2^(2048-64))
+function mtpVerifyDhParams(g, dhPrimeBytes, gABytes) {
+	if (g !== 3) throw new Error('dh.g != 3');
+	if (mtpHex(dhPrimeBytes) !== MTPROTO_DH_PRIME_HEX) throw new Error('dh_prime incorrect');
+	const p = mtpBytesToBigInt(dhPrimeBytes);
+	const gA = mtpBytesToBigInt(gABytes);
+	if (gA <= 1n) throw new Error('g_a <= 1');
+	if (gA >= p - 1n) throw new Error('g_a >= p-1');
+	const twoPow = 1n << BigInt(2048 - 64);
+	if (gA < twoPow) throw new Error('g_a < 2^(2048-64)');
+	if (gA >= p - twoPow) throw new Error('g_a >= p-2^(2048-64)');
+}
+
+// ---- 轮 A:单连接内完成 DH(req_pq_multi → dh_gen_ok),成功写 handshake ----
+async function mtpHandshakeRoundA(env, nextDcId) {
+	const dcId = nextDcId || MTPROTO_DEFAULT_DC_ID;
+	const dc = MTPROTO_DC_LIST.find((d) => d.id === dcId) || MTPROTO_DC_LIST[1];
+	let ctx = null;
+	try {
+		ctx = await mtpConnect(dc);
+		const nonce = mtpRandom(16);
+		await mtpSendPlain(ctx, mtpSerialize('req_pq_multi', { nonce }));
+		const resPQ = await mtpReadPlain(ctx);
+		if (!resPQ || resPQ._ !== 'resPQ') throw new Error('expect-resPQ');
+		if (!mtpBytesEqual(resPQ.nonce, nonce)) throw new Error('nonce-mismatch');
+		const serverNonce = resPQ.server_nonce;
+		const key = mtpFindRsaKey(resPQ.fingerprints);
+		if (!key) throw new Error('no-rsa-key');
+		const [pBytes, qBytes] = mtpFactorizePq(resPQ.pq);
+		const newNonce = mtpRandom(32);
+		// 默认 DC 用 p_q_inner_data;迁移场景(nextDcId)用 p_q_inner_data_dc 使 auth_key 绑定目标 DC
+		const innerBytes = nextDcId
+			? mtpSerialize('p_q_inner_data_dc', { pq: resPQ.pq, p: pBytes, q: qBytes, nonce, server_nonce: serverNonce, new_nonce: newNonce, dc: nextDcId })
+			: mtpSerialize('p_q_inner_data', { pq: resPQ.pq, p: pBytes, q: qBytes, nonce, server_nonce: serverNonce, new_nonce: newNonce });
+		const encryptedData = mtpRsaEncrypt(key, await mtpRsaPad(innerBytes));
+		await mtpSendPlain(ctx, mtpSerialize('req_DH_params', {
+			nonce,
+			server_nonce: serverNonce,
+			p: pBytes,
+			q: qBytes,
+			public_key_fingerprint: BigInt('0x' + key.fp),
+			encrypted_data: encryptedData
+		}));
+		const dhOk = await mtpReadPlain(ctx);
+		if (!dhOk || dhOk._ !== 'server_DH_params_ok') throw new Error('expect-server_DH_params_ok');
+		if (!mtpBytesEqual(dhOk.nonce, nonce) || !mtpBytesEqual(dhOk.server_nonce, serverNonce)) throw new Error('dh-nonce-mismatch');
+
+		// 临时 AES key/iv
+		const shaNC = await mtpSha1(mtpConcat(newNonce, serverNonce));
+		const shaCN = await mtpSha1(mtpConcat(serverNonce, newNonce));
+		const tmpKey = mtpConcat(shaNC, shaCN.slice(0, 12));
+		const tmpIv = mtpConcat(shaCN.slice(12, 20), await mtpSha1(mtpConcat(newNonce, newNonce)), newNonce.slice(0, 4));
+		const decrypted = mtpAesIgeDecrypt(tmpKey, tmpIv, dhOk.encrypted_answer);
+		const innerHash = decrypted.slice(0, 20);
+		const innerBody = decrypted.slice(20);
+		const ir = mtpReader(innerBody);
+		const dhInner = mtpParseCtor(ir, ir.u32());
+		if (!dhInner || dhInner._ !== 'server_DH_inner_data') throw new Error('expect-server_DH_inner_data');
+		if (!mtpBytesEqual(innerHash, await mtpSha1(innerBody.slice(0, ir.offset)))) throw new Error('dh-inner-hash');
+		if (!mtpBytesEqual(dhInner.nonce, nonce) || !mtpBytesEqual(dhInner.server_nonce, serverNonce)) throw new Error('dh-inner-nonce');
+
+		mtpVerifyDhParams(dhInner.g, dhInner.dh_prime, dhInner.g_a);
+		const p = mtpBytesToBigInt(dhInner.dh_prime);
+		const gA = mtpBytesToBigInt(dhInner.g_a);
+
+		// b = 2048-bit 随机(与参考库一致); g_b = g^b mod p
+		const bBytes = mtpRandom(256);
+		const b = mtpBytesToBigInt(bBytes);
+		const gB = mtpBigIntToBytes(mtpModPow(3n, b, p), 256);
+		const clientInnerBytes = mtpSerialize('client_DH_inner_data', { nonce, server_nonce: serverNonce, retry_id: 0n, g_b: gB });
+		const clientHash = await mtpSha1(clientInnerBytes);
+		const padLen = 16 - ((clientHash.length + clientInnerBytes.length) % 16);
+		const enc = mtpAesIgeEncrypt(tmpKey, tmpIv, mtpConcat(clientHash, clientInnerBytes, mtpRandom(padLen)));
+		await mtpSendPlain(ctx, mtpSerialize('set_client_DH_params', { nonce, server_nonce: serverNonce, encrypted_data: enc }));
+		const genOk = await mtpReadPlain(ctx);
+		if (!genOk || (genOk._ !== 'dh_gen_ok' && genOk._ !== 'dh_gen_retry' && genOk._ !== 'dh_gen_fail')) throw new Error('expect-dh_gen_ok');
+		if (genOk._ === 'dh_gen_fail') throw new Error('dh_gen_fail');
+		if (genOk._ === 'dh_gen_retry') throw new Error('dh_gen_retry');
+		if (!mtpBytesEqual(genOk.nonce, nonce) || !mtpBytesEqual(genOk.server_nonce, serverNonce)) throw new Error('gen-ok-nonce');
+
+		const serverSalt = mtpXor(newNonce.slice(0, 8), serverNonce.slice(0, 8));
+		const handshake = {
+			v: MTPROTO_SCHEMA_V,
+			stage: 'round_a_done',
+			dcId,
+			nonce: mtpHex(nonce),
+			serverNonce: mtpHex(serverNonce),
+			newNonce: mtpHex(newNonce),
+			tmpAesKey: mtpHex(tmpKey),
+			tmpAesIv: mtpHex(tmpIv),
+			b: mtpHex(bBytes),
+			gB: mtpHex(gB),
+			gABytes: mtpHex(dhInner.g_a),
+			dhPrimeHex: mtpHex(dhInner.dh_prime),
+			serverSalt: mtpHex(serverSalt),
+			genOkHash1: mtpHex(genOk.new_nonce_hash1),
+			failCount: 0,
+			cooldownUntil: 0,
+			shardStep: 0,
+			shardAcc: ''
+		};
+		await mtpSaveHandshake(env, handshake);
+		console.log(`[MTProto] 轮 A 完成(dc=${dcId}, gB_sha256_8=${mtpHex((await mtpSha256(gB)).slice(0, 8))})`);
+		return { ok: true, dcId };
+	} catch (error) {
+		console.error('[MTProto] 轮 A 失败:', mtpClassifyError(error).kind, '-', error && error.message);
+		await mtpBumpFailure(env);
+		return { ok: false, err: mtpClassifyError(error).kind };
+	} finally {
+		if (ctx && ctx.socket) { try { await ctx.socket.close(); } catch (_) { /* ignore */ } }
+	}
+}
+
+// ---- 轮 B:算 auth_key + 校验 dh_gen_ok + bot 登录 + getParticipant + 会话落盘 ----
+async function mtpHandshakeRoundB(env, tgid, currentChatId) {
+	const hs = await mtpLoadHandshake(env);
+	if (!hs || hs.stage !== 'round_a_done') return { ok: false, err: 'no-handshake' };
+	const dc = MTPROTO_DC_LIST.find((d) => d.id === hs.dcId) || MTPROTO_DC_LIST[1];
+	let ctx = null;
+	try {
+		// auth_key = g_a^b mod dh_prime(第二处 modexp,纯本地计算)
+		const b = mtpBytesToBigInt(mtpHexToBytes(hs.b));
+		const gA = mtpBytesToBigInt(mtpHexToBytes(hs.gABytes));
+		const p = mtpBytesToBigInt(mtpHexToBytes(hs.dhPrimeHex));
+		const authKey = mtpBigIntToBytes(mtpModPow(gA, b, p), 256);
+		const auxHash = (await mtpSha1(authKey)).slice(0, 8);
+		if (!(await mtpVerifyGenOk(mtpHexToBytes(hs.newNonce), auxHash, mtpHexToBytes(hs.genOkHash1)))) {
+			console.error('[MTProto] 轮 B 校验 dh_gen_ok 失败,清握手重建');
+			await mtpClearHandshake(env);
+			await mtpBumpFailure(env);
+			return { ok: false, err: 'gen-ok-hash' };
+		}
+		ctx = await mtpConnect(dc);
+		const session = {
+			authKey,
+			serverSalt: mtpHexToBytes(hs.serverSalt),
+			sessionId: mtpRandom(8),
+			timeOffset: 0,
+			seqNo: 0 // 会话级 content 消息计数(login=1, 后续查询递增)
+		};
+		const tokenFp = await mtpTokenFingerprint(env);
+		// bot 登录
+		const login = await mtpRpcCall(ctx, session, mtpSerMethod('auth.importBotAuthorization', {
+			api_id: TG_API_ID,
+			api_hash: TG_API_HASH,
+			bot_auth_token: BOT_TOKEN || ''
+		}));
+		if (!login.ok) {
+			if (login.kind === MTPROTO_ERR.T_MIGRATE && login.nextDcId) {
+				console.error(`[MTProto] 轮 B 收到 DC 迁移: nextDcId=${login.nextDcId}`);
+				await mtpSaveHandshake(env, { v: MTPROTO_SCHEMA_V, stage: 'migrate', nextDcId: login.nextDcId, failCount: 0, cooldownUntil: 0 });
+				return { ok: false, migrating: true, nextDcId: login.nextDcId };
+			}
+			console.error('[MTProto] 轮 B bot 登录失败:', login.kind);
+			await mtpBumpFailure(env);
+			return { ok: false, err: login.kind };
+		}
+		// 登录成功后持久化会话(登录凭据与连接无关); 带当前 seqNo(login 已占号)
+		await mtpSaveSession(env, mtpSessionRecord(session, hs.dcId, tokenFp));
+		await mtpClearHandshake(env);
+		console.log('[MTProto] 轮 B 登录成功,会话已建立');
+		// 同连接内查询 participant
+		const participant = await mtpQueryParticipantInCtx(ctx, session, currentChatId, tgid);
+		if (participant.authError) { await mtpClearSession(env); return { ok: false, err: MTPROTO_ERR.T_AUTH }; }
+		// 占号写回: 查询已使会话级 seqNo 前进(login+查询计数), 覆盖持久化(成败均写回, 绝不回退)
+		await mtpSaveSession(env, mtpSessionRecord(session, hs.dcId, tokenFp));
+		const joinedAt = participant.ok ? mtpSelectParticipantDate(participant.participant, Math.floor(Date.now() / 1000)) : 0;
+		return { ok: true, session, joinedAt };
+	} catch (error) {
+		console.error('[MTProto] 轮 B 失败:', mtpClassifyError(error).kind);
+		await mtpBumpFailure(env);
+		return { ok: false, err: mtpClassifyError(error).kind };
+	} finally {
+		if (ctx && ctx.socket) { try { await ctx.socket.close(); } catch (_) { /* ignore */ } }
+	}
+}
+
+// 在既有连接上查询 participant(轮 B 复用连接;日常路径新建连接)。
+// 链路: ① 解析/复用 channel 真实 access_hash(零 hash 调 channels.getChannels) → ② getParticipant(真 channel hash, user 零 hash)。
+async function mtpQueryParticipantInCtx(ctx, session, chatId, tgid) {
+	const channelId = mtpChannelIdFromChatId(chatId);
+	// ① channel access_hash: 优先会话级缓存(与 auth 会话绑定; 随会话整体清空)
+	let channelHash = null;
+	if (session.channelCacheId === String(chatId) && session.channelCacheHash) {
+		channelHash = BigInt(session.channelCacheHash);
+	} else {
+		const rc = await mtpRpcCall(ctx, session, mtpSerMethod('channels.getChannels', { channel_id: channelId }));
+		if (!rc.ok) {
+			const authError = rc.kind === MTPROTO_ERR.T_AUTH;
+			if (!authError) console.log('[MTProto] channel access_hash 解析失败(分类=' + rc.kind + ', chatId=' + chatId + ',已忽略)');
+			return { ok: false, authError, kind: rc.kind };
+		}
+		const chats = rc.result && rc.result.chats;
+		const ch = Array.isArray(chats)
+			? chats.find((x) => x && x._ === 'channel' && String(x.id) === String(channelId) && x.access_hash != null)
+			: null;
+		if (!ch) {
+			console.log('[MTProto] channel access_hash 未取到(chatId=' + chatId + ',已忽略)');
+			return { ok: false, authError: false, kind: MTPROTO_ERR.T_RPC };
+		}
+		channelHash = BigInt(ch.access_hash);
+		session.channelCacheId = String(chatId);
+		session.channelCacheHash = String(channelHash); // 存字符串; 不打 hash 值本身
+		console.log('[MTProto] channel access_hash 已解析(chatId=' + chatId + ')');
+	}
+	// ② 用真 channel hash 查询( user 侧零 hash)
+	const res = await mtpRpcCall(ctx, session, mtpSerMethod('channels.getParticipant', { channel_id: channelId, channel_hash: channelHash, user_id: BigInt(tgid) }));
+	if (!res.ok) {
+		const authError = res.kind === MTPROTO_ERR.T_AUTH;
+		if (!authError) console.log('[MTProto] getParticipant 未取到(分类=' + res.kind + ', tgid=' + tgid + ', code=' + ((res.error && res.error.error_code) || '-') + ', msg=' + ((res.error && res.error.error_message) || '-') + ',已忽略)');
+		return { ok: false, authError, kind: res.kind };
+	}
+	const r = res.result;
+	const participant = r && r._ === 'channels.channelParticipant' ? r.participant : null;
+	return { ok: true, participant };
+}
+
+// ---- 门面:日常查询(会话就绪,新连接) ----
+async function mtpQueryDaily(env, session, chatId, tgid) {
+	const dc = MTPROTO_DC_LIST.find((d) => d.id === session.dcId) || MTPROTO_DC_LIST[1];
+	let ctx = null;
+	const startSeq = Number.isInteger(session.seqNo) && session.seqNo >= 0 ? session.seqNo : 0;
+	const s = {
+		authKey: mtpHexToBytes(session.authKey),
+		serverSalt: mtpHexToBytes(session.serverSalt),
+		sessionId: mtpHexToBytes(session.sessionId),
+		timeOffset: session.timeOffset || 0,
+		seqNo: startSeq,
+		channelCacheId: session.channelCacheId,   // 复用会话级 channel hash 缓存
+		channelCacheHash: session.channelCacheHash
+	};
+	let clearedSession = false;
+	let wroteBack = false;
+	try {
+		ctx = await mtpConnect(dc);
+		const participant = await mtpQueryParticipantInCtx(ctx, s, chatId, tgid);
+		if (participant.authError) { await mtpClearSession(env); clearedSession = true; return { ok: false, joinedAt: 0 }; }
+		// 占号写回: 无论查询成败, 已发送消息即占用 seq(可能已达服务器), 绝不回退
+		session.seqNo = s.seqNo;
+		session.channelCacheId = s.channelCacheId;
+		session.channelCacheHash = s.channelCacheHash;
+		session.lastUsedAt = Math.floor(Date.now() / 1000);
+		await mtpSaveSession(env, session);
+		wroteBack = true;
+		if (!participant.ok) return { ok: false, joinedAt: 0 };
+		return { ok: true, joinedAt: mtpSelectParticipantDate(participant.participant, Math.floor(Date.now() / 1000)) };
+	} catch (error) {
+		console.error('[MTProto] 日常查询失败:', mtpClassifyError(error).kind);
+		return { ok: false, joinedAt: 0 };
+	} finally {
+		// 异常兜底: 消息可能已发出(seq 已占号)但未写回 → 补写(不覆盖已清会话)
+		if (!wroteBack && !clearedSession && s.seqNo > startSeq) {
+			try {
+				const cur = await mtpLoadSession(env);
+				if (cur && cur.sessionId === session.sessionId) {
+					cur.seqNo = s.seqNo;
+					cur.channelCacheId = s.channelCacheId;
+					cur.channelCacheHash = s.channelCacheHash;
+					cur.lastUsedAt = Math.floor(Date.now() / 1000);
+					await mtpSaveSession(env, cur);
+				}
+			} catch (_) { /* ignore */ }
+		}
+		if (ctx && ctx.socket) { try { await ctx.socket.close(); } catch (_) { /* ignore */ } }
+	}
+}
+
+// channelId 推导: -100xxxxxxxxxx → 去 " -100" 前缀得 MTProto channel_id
+function mtpChannelIdFromChatId(chatId) {
+	const s = String(chatId);
+	if (s.startsWith('-100')) return BigInt(s.slice(4));
+	return BigInt(s.replace('-', ''));
+}
+
+// 日期甄别(2025-10 修订, 原 D6):channelParticipant / channelParticipantSelf / channelParticipantAdmin /
+// channelParticipantBanned 的 date 均视为入群时间; Creator(无 date 字段)不取; 0 < date <= now+60 才有效。
+// D6 修订依据: channelParticipantBanned.date 官方语义 = "When did the user join the group"(加入群组时间);
+//   left(是否已离开) 与 banned_rights(限制权限) 均不影响 date 语义; 用户实测与同类 bot 结果一致。
+function mtpSelectParticipantDate(participant, nowSec) {
+	if (!participant) return 0;
+	const t = participant._;
+	if (t !== 'channelParticipant' && t !== 'channelParticipantSelf' && t !== 'channelParticipantAdmin' && t !== 'channelParticipantBanned') return 0;
+	const date = Number(participant.date) || 0;
+	if (date > 0 && date <= nowSec + 60) return date;
+	return 0;
+}
+
+// ---- 唯一门面:状态机编排 + 全 try/catch 兜底 + 补写库 ----
+// 返回 { status:'ready'|'initializing'|'unavailable', joinedAt }
+async function mtpResolveJoinedAtForCheck(env, currentChatId, tgid) {
+	try {
+		if (!mtpIsAvailable(env)) return { status: 'unavailable', joinedAt: 0 };
+		const sockets = await mtpGetSockets();
+		if (!sockets) return { status: 'unavailable', joinedAt: 0 };
+		const now = Math.floor(Date.now() / 1000);
+
+		// 1) 会话就绪 → 日常查询
+		const session = await mtpLoadSession(env);
+		if (session) {
+			const fp = await mtpTokenFingerprint(env);
+			if (session.tokenFp && session.tokenFp !== fp) {
+				// token/api 变更 → 清会话重建
+				await mtpClearSession(env);
+			} else {
+				const r = await mtpQueryDaily(env, session, currentChatId, tgid);
+				if (r.ok && r.joinedAt > 0) {
+					await dbBackfillUserGroupJoinedAt(env, tgid, currentChatId, r.joinedAt);
+					return { status: 'ready', joinedAt: r.joinedAt };
+				}
+				return { status: 'ready', joinedAt: 0 };
+			}
+		}
+
+		// 2) 无会话 → 读握手状态
+		let hs = await mtpLoadHandshake(env);
+		if (hs && hs.stage === 'cooldown') {
+			if ((hs.cooldownUntil || 0) > now) return { status: 'unavailable', joinedAt: 0 };
+			await mtpClearHandshake(env);
+			hs = null;
+		}
+
+		// 3) DC 迁移 → 在目标 DC 用 p_q_inner_data_dc 重做轮 A
+		if (hs && hs.stage === 'migrate' && hs.nextDcId) {
+			const nextDcId = hs.nextDcId;
+			await mtpClearHandshake(env);
+			const ra = await mtpHandshakeRoundA(env, nextDcId);
+			return ra.ok ? { status: 'initializing', joinedAt: 0 } : { status: 'unavailable', joinedAt: 0 };
+		}
+
+		// 4) 无握手 → 做轮 A(单连接内完成 DH)
+		if (!hs || hs.stage !== 'round_a_done') {
+			const ra = await mtpHandshakeRoundA(env);
+			return ra.ok ? { status: 'initializing', joinedAt: 0 } : { status: 'unavailable', joinedAt: 0 };
+		}
+
+		// 5) 握手就绪 → 做轮 B(算 auth_key + 登录 + 查询)
+		const rb = await mtpHandshakeRoundB(env, tgid, currentChatId);
+		if (rb.ok && rb.joinedAt > 0) {
+			await dbBackfillUserGroupJoinedAt(env, tgid, currentChatId, rb.joinedAt);
+			return { status: 'ready', joinedAt: rb.joinedAt };
+		}
+		if (rb.ok) return { status: 'ready', joinedAt: 0 };
+		if (rb.migrating) return { status: 'initializing', joinedAt: 0 };
+		return { status: 'initializing', joinedAt: 0 };
+	} catch (error) {
+		console.error('[MTProto] 补录异常(已忽略):', error && error.message);
+		return { status: 'unavailable', joinedAt: 0 };
+	}
+}
+
+// ---- DB 层新增函数(只增不改,元素不存在绝不建档) ----
+// 只读:返回某用户在某群的元素存在性与 joinedAt(用于 D2 区分"元素不存在"与"joinedAt<=0")。
+async function dbGetUserGroupJoinedAtState(env, tgid, chatId) {
+	if (!hasDb(env)) return { exists: false, joinedAt: 0 };
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row || !row.active_group_ids) return { exists: false, joinedAt: 0 };
+		const groups = parseActiveGroups(row.active_group_ids);
+		const found = groups.find((g) => g.id === String(chatId));
+		if (!found) return { exists: false, joinedAt: 0 };
+		return { exists: true, joinedAt: Number.isInteger(found.joinedAt) && found.joinedAt > 0 ? found.joinedAt : 0 };
+	} catch (error) {
+		console.error('[DB] 读取群元素状态失败:', error && error.message);
+		return { exists: false, joinedAt: 0 };
+	}
+}
+
+// 只增不改核心:仅当元素存在且 joinedAt<=0 且传入为正整数时更新该元素 joinedAt;status 原样保留;绝不建档。
+async function dbBackfillUserGroupJoinedAt(env, tgid, chatId, joinedAt) {
+	if (!hasDb(env)) return false;
+	const ts = Number(joinedAt);
+	if (!Number.isInteger(ts) || ts <= 0) return false;
+	const tgidStr = String(tgid);
+	const chatIdStr = String(chatId);
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(tgidStr).first();
+		if (!row || !row.active_group_ids) return false; // 无行 → 不建档
+		const groups = parseActiveGroups(row.active_group_ids);
+		const idx = groups.findIndex((g) => g.id === chatIdStr);
+		if (idx < 0) return false; // 元素不存在 → 不建档
+		if (Number.isInteger(groups[idx].joinedAt) && groups[idx].joinedAt > 0) return false; // 只增不改
+		groups[idx].joinedAt = ts; // status 原样保留
+		await env.DB.prepare(
+			`INSERT INTO users (tgid, active_group_ids, created_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(tgid) DO UPDATE SET active_group_ids = excluded.active_group_ids`
+		).bind(tgidStr, JSON.stringify(groups), Math.floor(Date.now() / 1000)).run();
+		return true;
+	} catch (error) {
+		console.error('[DB] 补写入群时间失败:', error && error.message);
+		return false;
+	}
+}
+
+// ---- 后台任务:/check 占位后循环推进补录, 完成后二次编辑消息补上入群时间 ----
+// 由调用方经 ctx.waitUntil 注册; 内部全 try/catch, 永不抛错、永不阻断。
+// 结束态: ready&joinedAt>0 → 入群时间行; 其余(含 unavailable/deadline/异常) → MTPROTO_FAILED_LINE。
+// 替换保持单行行数不变, 不触碰其它内容与 ├/└ 树形结构(不要用删行/改前缀方案)。
+async function mtpRunJoinedAtBackfillTask(env, params) {
+	const { editChatId, editMessageId, queryChatId, tgid, baseText, replyMarkup } = params || {};
+	if (!editChatId || !editMessageId || !baseText || baseText.indexOf(MTPROTO_QUERYING_LINE) < 0) return;
+	const startedAt = Date.now();
+	let final = { status: 'unavailable', joinedAt: 0 };
+	try {
+		for (let step = 0; step < MTPROTO_BG_MAX_STEPS; step++) {
+			if (Date.now() - startedAt > MTPROTO_BG_DEADLINE_MS) break;
+			const r = await mtpResolveJoinedAtForCheck(env, queryChatId, tgid);
+			if (r) final = { status: r.status, joinedAt: r.joinedAt || 0 };
+			if (!r || r.status !== 'initializing') break;
+		}
+	} catch (error) {
+		console.error('[MTProto] 后台补录异常(已忽略):', error && error.message);
+	}
+	const newLine = (final.status === 'ready' && final.joinedAt > 0)
+		? `入群时间: <b>${formatTimestamp(final.joinedAt).slice(0, 16)}</b>（${formatRelativeTime(final.joinedAt)}）`
+		: MTPROTO_FAILED_LINE;
+	const newText = baseText.replace(MTPROTO_QUERYING_LINE, newLine);
+	try {
+		await editMessageText(editChatId, editMessageId, newText, replyMarkup);
+		console.log(`[MTProto] 后台补录完成: status=${final.status}, joinedAt=${final.joinedAt > 0 ? '有' : '无'}`);
+	} catch (error) {
+		console.error('[MTProto] 后台补录编辑消息失败(已忽略):', error && error.message);
+	}
+}
+// [MTPROTO-END]
+
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// 1. 查询 gkybot
 	let banlistData = { success: false, banned: false, error: '未执行查询' };
@@ -1929,6 +3629,67 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// TGID 用 <code> 包裹(长按可复制纯数字),替代此前的 <a href="tg://user?id=..."> 链接;
 	// 用户反馈:管理员核对 TGID 时直接长按复制比"点击链接展开用户信息"更顺手。
 	responseMessage += `📋 <b>TGID:</b> <code>${escapeHtml(tgidToCheck)}</code>\n\n`;
+
+	// 当前群组状态(2026-09-23 新增):仅"群内 /check"场景输出(私聊场景无"当前群"语义,多主群会导致状态歧义)。
+	// 判定来源 = options.chatInfo(由调用方传入当前会话所在群 chat 对象),以 getChatMember 实时结果为准;
+	// DB 本地记录(dbGetUserGroupStatus)仅作辅助明细,避免实时状态与本地记录不一致时误导管理员。
+	// 位置:TGID 行与联网黑名单区块之间,既紧随用户标识便于横向核对,又不打乱既有两个黑名单区块的相对顺序。
+	// [MTProto] 后台补录待办:构建响应时同步判定得到(无网络);非 null 时调用方经 ctx.waitUntil 注册后台任务。
+	let mtpPending = null;
+	if (options.chatInfo) {
+		const currentChatId = options.chatInfo.id;
+		const liveStatus = await resolveUserGroupStatusInChat(currentChatId, tgidToCheck);
+		// DB 本地记录:仅在与实时状态不同且确实存在记录时,作为提示明细附在状态行下
+		let statusNote = '';
+		if (options.env) {
+			const recordedStatus = await dbGetUserGroupStatus(options.env, tgidToCheck, currentChatId);
+			if (recordedStatus && recordedStatus !== liveStatus) {
+				statusNote = `本地记录: <b>${escapeHtml(describeCurrentChatStatus(recordedStatus).label)}</b>（与实时状态不一致，以实时为准）`;
+			}
+		}
+		// 入群时间(2026-10-13 新增):仅当 DB 已就绪且能读到本群 joinedAt>0 时展示该行;
+		// 语义 = 用户在"当前群"的最近一次入群时间戳(秒级,以 UTC+8 展示),附相对时长便于管理员快速判读。
+		// 无记录 / 字段异常 / env 缺失 → 不展示该行,也不加任何兜底文案(不做"入群时间: 未知")。
+		let joinedAtSec = 0;
+		if (options.env) {
+			joinedAtSec = await dbGetUserGroupJoinedAt(options.env, tgidToCheck, currentChatId);
+		}
+		// [MTProto] 增量:元素存在且 joinedAt<=0 时,输出占位行并由调用方经 ctx.waitUntil 后台补录;
+		// 本处只做同步可用性判定(无网络);通道不可用 → 逐字静默,不启动后台
+		if (options.env && joinedAtSec <= 0) {
+			try {
+				const elemState = await dbGetUserGroupJoinedAtState(options.env, tgidToCheck, currentChatId);
+				if (elemState && elemState.exists && mtpIsAvailable(options.env)) {   // D2:元素不存在 → 不触发
+					const sockets = await mtpGetSockets();
+					if (sockets) mtpPending = { currentChatId, tgid: tgidToCheck };
+				}
+			} catch (error) {
+				console.error('[MTProto] /check 占位判定异常(已忽略):', error?.message);
+			}
+		}
+		const described = describeCurrentChatStatus(liveStatus);
+		responseMessage += `🧭 <b>当前群组状态:</b> ${described.icon} <b>${described.label}</b>\n`;
+		// 树形层级排版(与下方"联网黑名单"区块完全同手法):明细行先收集进数组再统一挂靠在状态行下,
+		// 非末行前缀 " ├ "、末行前缀 " └ ";顺序 = 状态说明 desc → 入群时间(仅 joinedAtSec>0)→ 本地记录 statusNote。
+		// 仅 desc 单行时仍输出 " └ "(与改造前一致),向后兼容既有输出。
+		const statusDetailLines = [escapeHtml(described.desc)];
+		if (joinedAtSec > 0) {
+			// 该行内容全部由代码生成(数字 + 固定中文),无用户可控文本,故无需 escapeHtml;
+			// 格式:入群时间: YYYY-MM-DD HH:MM（相对时长）—— 冒号半角+空格、时长无空格、括号全角。
+			statusDetailLines.push(`入群时间: <b>${formatTimestamp(joinedAtSec).slice(0, 16)}</b>（${formatRelativeTime(joinedAtSec)}）`);
+		} else if (mtpPending) {
+			// [MTProto] 存在但 joinedAt<=0 且通道可用 → 占位行(与入群时间行同位置;后台完成后 editMessageText
+			// 逐字替换本行, 行数恒为 1, 不增删行、不改 ├/└ 前缀, 树形结构稳定)。
+			statusDetailLines.push(MTPROTO_QUERYING_LINE);
+		}
+		if (statusNote) {
+			statusDetailLines.push(statusNote);
+		}
+		statusDetailLines.forEach((line, i) => {
+			responseMessage += `${i === statusDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
+		});
+		responseMessage += '\n';
+	}
 
 	// 联网黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	// 2026-09-06 用户定版:联网黑名单区块排在 GKY黑名单 之前
@@ -1997,12 +3758,11 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		} else {
 			responseMessage += `🌐 <b>GKY黑名单:</b> ✅ 正常\n`;
 		}
-	} else {
-		responseMessage += `🌐 <b>GKY黑名单:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
+	// 查询失败(!banlistData.success)时整块静默:不输出任何 GKY 相关字样,避免误导管理员
 
 	if (!options.includeReviewAction) {
-		return { text: responseMessage };
+		return { text: responseMessage, mtpPending };
 	}
 
 	const inlineKeyboard = [];
@@ -2043,7 +3803,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	return {
 		text: responseMessage,
-		replyMarkup
+		replyMarkup,
+		mtpPending
 	};
 }
 
@@ -2105,6 +3866,37 @@ function getNewMemberLogInfo(message, member) {
 	};
 }
 
+// 处理 chat_member 类型的 update(成员状态变化;Bot API 7.2+,需 setWebhook allowed_updates 订阅 chat_member)。
+// 背景:大群/隐藏成员列表等场景下 Telegram 不发送 new_chat_members 服务消息(社区验证事实),
+//       chat_member 是官方推荐的可靠替代——"验证新用户"类机器人均依赖它。
+// 判定「新加入」:old_chat_member.status 为 left(此前不在群)、new_chat_member.status 为 member/restricted(现已进群),
+//       且成员为真人(is_bot 跳过,与入群建档/查杀"只处理真人"口径一致);其余状态变化(离开/禁言/权限等)静默忽略。
+// 命中则转换为一则虚拟的 new_chat_members 消息,复用 handleNewChatMemberBots 全链路
+//       (建档 + joinedAt + 非主群联网查杀 + 主群本地黑名单拦截),与真实服务消息完全同路径。
+// 幂等:极少数双事件场景(服务消息与 chat_member 同时到达)重复执行亦无副作用——DB 侧均为 upsert(仅重复刷新 joinedAt);
+//       容错:整函数 try/catch,异常只记日志,保证 webhook 始终正常响应。
+async function handleChatMemberUpdate(chatMemberUpdate, env) {
+	try {
+		const chat = chatMemberUpdate?.chat;
+		const oldMember = chatMemberUpdate?.old_chat_member;
+		const newMember = chatMemberUpdate?.new_chat_member;
+		const user = newMember?.user;
+		if (!chat || !user) return;
+		const wasAbsent = oldMember?.status === 'left';
+		const isJoinedNow = newMember?.status === 'member' || newMember?.status === 'restricted';
+		if (!wasAbsent || !isJoinedNow || user.is_bot) return;
+		console.log(`[进群消息] 收到入群事件(chat_member): 群="${chat.title || ''}"(${chat.id}), 新成员: ${user.id}(${user.first_name || ''}${user.username ? '@' + user.username : ''})`);
+		await handleNewChatMemberBots({
+			chat,
+			from: chatMemberUpdate.from || user,
+			date: chatMemberUpdate.date,
+			new_chat_members: [user]
+		}, env);
+	} catch (error) {
+		console.error('[进群消息] chat_member 处理异常:', error.message);
+	}
+}
+
 async function handleNewChatMemberBots(message, env) {
 	const chat = message.chat;
 	const newMembers = message.new_chat_members;
@@ -2115,7 +3907,8 @@ async function handleNewChatMemberBots(message, env) {
 
 	logBotModeration('new-members:found', {
 		...getMessageLogInfo(message),
-		新成员数量: newMembers.length
+		新成员数量: newMembers.length,
+		成员: newMembers.map((m) => `${m?.id ?? '?'}${m?.is_bot ? '(bot)' : ''}`).join(', ')
 	});
 
 	if (!chat || !isMainGroup(chat.id)) {
@@ -2126,6 +3919,19 @@ async function handleNewChatMemberBots(message, env) {
 			await handleNetworkBlacklistKill(chat, newMembers, env);
 		} catch (error) {
 			console.error('[机器人风控] 联网查杀(入群)异常:', error.message);
+		}
+		// 入群即时建档 + 记录入群时间(非主群):为新入群真人成员建档,不依赖其后续发言,并刷新"最近一次入群时间戳"。
+		// 置于查杀之后:无记录用户仍由查杀 record 分支先建档,本函数读到已有记录即按"只增不改"刷新 joinedAt(查杀行为逐字不变);
+		// 同时覆盖"bot 非本群管理员"(查杀整群跳过)的群。守卫 isDbReady(env) && chat,逐人只处理真人。
+		if (isDbReady(env) && chat) {
+			for (const member of newMembers) {
+				if (!member || member.is_bot) continue;
+				if (member.id === undefined || member.id === null) continue;
+				// 建档/刷时间的观测日志由 ensureUserRecordOnJoin 内部统一输出(首次建档/已存在/写入失败三类)
+				await ensureUserRecordOnJoin(env, member.id, chat.id);
+			}
+		} else {
+			console.log('[入群建档] 跳过: 数据库未就绪(未绑定 D1),无法为入群成员建档');
 		}
 		return true;
 	}
@@ -2146,6 +3952,11 @@ async function handleNewChatMemberBots(message, env) {
 				logBotModeration('skip:new-member-without-id', logInfo);
 				continue;
 			}
+			// 入群即时建档 + 记录入群时间(主群):为新入群真人成员立即建档,不依赖其后续发言;
+			// 同时写入"最近一次入群时间戳"(joinedAt,秒级),只有"进群消息"会触发该时间更新。
+			// 本群已有记录时 status 原样保留(只增不改);命中本地黑名单者随后被封禁覆写为"封禁",最终状态正确。
+			// 建档/刷时间的观测日志由 ensureUserRecordOnJoin 内部统一输出(首次建档/已存在/写入失败三类)
+			await ensureUserRecordOnJoin(env, member.id, chat.id);
 			try {
 				const blacklistCheck = await checkBlacklist(member.id, env);
 				if (blacklistCheck.isBlacklisted) {
@@ -2210,7 +4021,7 @@ async function handleNewChatMemberBots(message, env) {
 	return true;
 }
 
-async function handleMessage(message, env) {
+async function handleMessage(message, env, ctx) {
 	if (await handleNewChatMemberBots(message, env)) {
 		return;
 	}
@@ -2264,30 +4075,30 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 请回复要禁言的用户消息后再发送 <code>/spam</code>');
 				return;
 			}
-		try {
-			await muteChatMember(chatId, repliedUserId);
-			await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
-			// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
-			// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
-			// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
-			const muteUserLabel = message.reply_to_message?.from
-				? formatBannedUserLabel(message.reply_to_message.from)
-				: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-			await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
-			// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
-			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
-			await deleteMessage(chatId, message.reply_to_message.message_id);
-		} catch (error) {
-			// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
-			if (error && error.code === 'TARGET_ALREADY_BANNED') {
-				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-				await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
-				// deleteMessage 内部已 try-catch,独立于禁言成败
+			try {
+				await muteChatMember(chatId, repliedUserId);
+				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
+				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
+				// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
+				// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
+				const muteUserLabel = message.reply_to_message?.from
+					? formatBannedUserLabel(message.reply_to_message.from)
+					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
+				// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
+				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 				await deleteMessage(chatId, message.reply_to_message.message_id);
-			} else {
-				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+			} catch (error) {
+				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
+				if (error && error.code === 'TARGET_ALREADY_BANNED') {
+					await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+					await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
+					// deleteMessage 内部已 try-catch,独立于禁言成败
+					await deleteMessage(chatId, message.reply_to_message.message_id);
+				} else {
+					await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+				}
 			}
-		}
 			return;
 		}
 
@@ -2331,18 +4142,20 @@ async function handleMessage(message, env) {
 					await muteChatMember(chatId, repliedUserId);
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 					responseMessage += `\n✅ 已在群内禁言 ${spamUserLabel}`;
-			} catch (error) {
-				console.error('群内禁言失败:', error);
-				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
-				if (error && error.code === 'TARGET_ALREADY_BANNED') {
-					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
-					responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
-				} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
-					responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
-				} else {
-					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+				} catch (error) {
+					// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
+					if (error && error.code === 'TARGET_ALREADY_BANNED') {
+						await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
+						responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
+					} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+						responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
+					} else {
+						// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
+						// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
+						console.error('群内禁言失败:', error);
+						responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+					}
 				}
-			}
 			}
 			// 回复 /spam 场景:被回复的这条消息即违规内容,拉黑处理成功后同步删除
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
@@ -2470,36 +4283,51 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-// 占位 + 编辑落定(用户反馈:之前占位与查询结果两条消息挤在一起不美观):
-	// 改为先发占位,捕获 messageId,最终结果用 editMessageText 替换占位,
-	// 对话上下文里只剩一条消息,管理员体验更清晰。
-	const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
-	const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
-	if (!placeholderMessageId) {
-		console.error('[/check] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
-	}
+		// 占位 + 编辑落定(用户反馈:之前占位与查询结果两条消息挤在一起不美观):
+		// 改为先发占位,捕获 messageId,最终结果用 editMessageText 替换占位,
+		// 对话上下文里只剩一条消息,管理员体验更清晰。
+		const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
+		const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
+		if (!placeholderMessageId) {
+			console.error('[/check] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
+		}
 
-	let targetUser = null;
-	if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
-		targetUser = repliedUser;
-	} else {
-		targetUser = await getManagedGroupUser(tgidToCheck);
-	}
+		let targetUser = null;
+		if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
+			targetUser = repliedUser;
+		} else {
+			targetUser = await getManagedGroupUser(tgidToCheck);
+		}
 
-	const response = await buildBanlistCheckResponse(tgidToCheck, {
-		targetUser,
-		includeReviewAction: true,
-		actionInCurrentChat: isManagedGroupMessage(message),
-		env
-	});
-	// 编辑占位为最终结果(失败兜底:fallback 另发一条)
-	if (placeholderMessageId) {
-		await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
-	} else {
-		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+		const response = await buildBanlistCheckResponse(tgidToCheck, {
+			targetUser,
+			includeReviewAction: true,
+			actionInCurrentChat: isManagedGroupMessage(message),
+			// 群内场景顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
+			chatInfo: isManagedGroupMessage(message) ? message.chat : null,
+			env
+		});
+		// 编辑占位为最终结果(失败兜底:fallback 另发一条)
+		let finalMessageId = placeholderMessageId;
+		if (placeholderMessageId) {
+			await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
+		} else {
+			const fallbackSent = await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			finalMessageId = fallbackSent?.ok ? fallbackSent.result?.message_id : null;
+		}
+		// 后台补录:注册 waitUntil,完成后二次编辑把占位行替换为入群时间行(偶发任务,不再为 CPU 预算妥协)
+		if (response.mtpPending && finalMessageId && ctx && typeof ctx.waitUntil === 'function') {
+			ctx.waitUntil(mtpRunJoinedAtBackfillTask(env, {
+				editChatId: chatId,
+				editMessageId: finalMessageId,
+				queryChatId: response.mtpPending.currentChatId,
+				tgid: response.mtpPending.tgid,
+				baseText: response.text,
+				replyMarkup: response.replyMarkup
+			}));
+		}
+		return;
 	}
-	return;
-}
 
 	// 处理 /start 命令（包含 deep link 参数）
 	if (text && text.startsWith('/start')) {
@@ -2541,7 +4369,7 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-// 提取 TGID
+			// 提取 TGID
 			const tgidToCheck = parts[1].replace('check_', '');
 			// 占位 + 编辑落定(同 /check 命令):先发占位,再编辑为最终结果,避免两条独立消息挤一起
 			const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
@@ -2549,11 +4377,29 @@ async function handleMessage(message, env) {
 			if (!placeholderMessageId) {
 				console.error('[/check deep-link] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
 			}
-			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
+			// 主群群内 deep-link 同样顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义)
+			const response = await buildBanlistCheckResponse(tgidToCheck, {
+				includeReviewAction: true,
+				chatInfo: isMainGroupChatHere ? message.chat : null,
+				env
+			});
+			let finalMessageId = placeholderMessageId;
 			if (placeholderMessageId) {
 				await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
 			} else {
-				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+				const fallbackSent = await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+				finalMessageId = fallbackSent?.ok ? fallbackSent.result?.message_id : null;
+			}
+			// 后台补录:注册 waitUntil,完成后二次编辑把占位行替换为入群时间行(偶发任务,不再为 CPU 预算妥协)
+			if (response.mtpPending && finalMessageId && ctx && typeof ctx.waitUntil === 'function') {
+				ctx.waitUntil(mtpRunJoinedAtBackfillTask(env, {
+					editChatId: chatId,
+					editMessageId: finalMessageId,
+					queryChatId: response.mtpPending.currentChatId,
+					tgid: response.mtpPending.tgid,
+					baseText: response.text,
+					replyMarkup: response.replyMarkup
+				}));
 			}
 
 			return;
@@ -2593,18 +4439,18 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
 				return;
 			}
-		try {
-			await banUserPermanently(chatId, targetUserId);
-			await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-			await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
-			// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
-			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
-			if (message.reply_to_message) {
-				await deleteMessage(chatId, message.reply_to_message.message_id);
+			try {
+				await banUserPermanently(chatId, targetUserId);
+				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
+				// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
+				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
+				if (message.reply_to_message) {
+					await deleteMessage(chatId, message.reply_to_message.message_id);
+				}
+			} catch (error) {
+				await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
 			}
-		} catch (error) {
-			await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
-		}
 			return;
 		}
 
@@ -2660,7 +4506,6 @@ async function handleMessage(message, env) {
 				// 群内禁言成功 → 标记该用户在本群(当前主群)状态为"禁言"
 				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 			} catch (error) {
-				console.error('群内禁言失败:', error);
 				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
 				if (error && error.code === 'TARGET_ALREADY_BANNED') {
 					await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
@@ -2670,6 +4515,9 @@ async function handleMessage(message, env) {
 						? '✅ 已将用户加入联网黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
 						: `${responseMessage}\nℹ️ 该用户当前不在群内，未执行禁言`;
 				} else {
+					// 上方两个预期分支(TARGET_ALREADY_BANNED/PARTICIPANT_ID_INVALID)属正常业务分流,不打 error 日志
+					// 仅此处真正未预期的禁言失败才记录 error,避免 CF 后台将预期分流误报为错误
+					console.error('群内禁言失败:', error);
 					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 				}
 			}
@@ -2842,39 +4690,39 @@ async function handleMessage(message, env) {
 
 		// 恢复用户在全部主群的群内状态(逐主群 getChatMember → unban/restrict → 回写"健康"):
 		// 旧单群版按单一 GROUP_ID 的 kicked/restricted/left/member 分支处理;
-// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
-	try {
-		const restoreResult = await restoreUserInAllMainGroups(userId, env);
-		await sendTelegramMessage(chatId, restoreResult.message);
-		// 系统后台通知 → 按群定向发送:各主群只收本群相关的动作/失败明细(broadcastPerGroup),
-		// "用户不在群内"等信息性条目与隔壁主群的操作不进该群通知(2026-09-04 用户反馈)。
-		if (restoreResult.notifyMainGroups) {
-			// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
-			// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
-			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
-				try {
-					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
-				} catch (error) {
-					// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
-					console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
-				}
-			}
-		}
-	} catch (error) {
-		console.error('自助解封恢复失败:', error);
-		// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
+		// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
 		try {
 			const restoreResult = await restoreUserInAllMainGroups(userId, env);
 			await sendTelegramMessage(chatId, restoreResult.message);
-		if (restoreResult.notifyMainGroups) {
-			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
-				try {
-					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
-				} catch (error) {
-					console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
+			// 系统后台通知 → 按群定向发送:各主群只收本群相关的动作/失败明细(broadcastPerGroup),
+			// "用户不在群内"等信息性条目与隔壁主群的操作不进该群通知(2026-09-04 用户反馈)。
+			if (restoreResult.notifyMainGroups) {
+				// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
+				// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
+				for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+					try {
+						await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
+					} catch (error) {
+						// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
+						console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
+					}
 				}
 			}
-		}
+		} catch (error) {
+			console.error('自助解封恢复失败:', error);
+			// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
+			try {
+				const restoreResult = await restoreUserInAllMainGroups(userId, env);
+				await sendTelegramMessage(chatId, restoreResult.message);
+				if (restoreResult.notifyMainGroups) {
+					for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+						try {
+							await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
+						} catch (error) {
+							console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
+						}
+					}
+				}
 			} catch (restoreError) {
 				console.error('自助解封降级恢复失败:', restoreError);
 				await sendTelegramMessage(
@@ -2891,7 +4739,8 @@ async function handleMessage(message, env) {
 		try {
 			const TG黑名单 = await handleBanlist(userId);
 			const banlistData = JSON.parse(TG黑名单);
-			if (banlistData.banned) {
+			// 仅在查询成功且确实命中封禁时才上报;查询失败(success:false)静默跳过,不广播、不提及 GKY
+			if (banlistData.success && banlistData.banned) {
 				const botUsername = await getBotUsername();
 				let infoMessage = `⚠️ 注意：您的账号在 GKYbot 联网黑名单中存在封禁记录。\n`;
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
@@ -3030,6 +4879,7 @@ async function muteChatMember(chatId, userId) {
 	// 但覆盖了确定性场景(nmBot 等已封禁后本 bot 再禁言)。
 	const memberInfo = await getChatMemberInfo(chatId, userId);
 	if (memberInfo?.status === 'kicked') {
+		/** @type {Error & { code?: string }} */
 		const error = new Error('TARGET_ALREADY_BANNED: 用户已被封禁,跳过禁言(避免封禁被降级为受限)');
 		error.code = 'TARGET_ALREADY_BANNED';
 		throw error;
@@ -3192,10 +5042,11 @@ async function handleBanlist(chatId) {
 			};
 		}
 
-		// 提取封禁信息
+		// 提取封禁信息(默认不预设 banned:true;仅当确实命中至少一个封禁字段时才判定为已封禁,
+		// 避免 GKYbot 返回 502 错误页等无法识别内容时被误判为已封禁)
 		const result = {
-			success: true,
-			banned: true,
+			success: false,
+			banned: false,
 			tgid: null,
 			chatId: null,
 			msgId: null,
@@ -3263,6 +5114,29 @@ async function handleBanlist(chatId) {
 			}
 		}
 
+		// 校验:页面既非"无记录",又未提取到任何封禁字段 → 无法识别(大概率是错误页/异常内容),
+		// 返回失败结构,绝不默认 banned:true
+		const hasBanField = result.recordedDate !== null || result.tgid !== null ||
+			result.chatId !== null || result.msgId !== null ||
+			result.reason !== null || result.info !== null;
+		if (!hasBanField) {
+			return {
+				success: false,
+				banned: false,
+				tgid: tgid,
+				chatId: null,
+				msgId: null,
+				reason: null,
+				info: null,
+				recordedDate: null,
+				error: '无法识别 GKYbot 返回内容'
+			};
+		}
+
+		// 至少命中一个真实封禁字段 → 判定为已封禁
+		result.success = true;
+		result.banned = true;
+
 		return result;
 	}
 
@@ -3273,15 +5147,26 @@ async function handleBanlist(chatId) {
 		});
 	}
 
-	// 访问原始的 banlist API
+	// 访问原始的 banlist API(网络异常/非 2xx 一律视为查询失败,显式返回 banned:false,绝不误判为已封禁)
 	const targetUrl = `https://gkybot.gmeow.cc/banlist?tgid=${chatId}`;
-	const response = await fetch(targetUrl);
-	const html = await response.text();
+	try {
+		const response = await fetch(targetUrl);
+		if (!response.ok) {
+			// 502/500 等错误页不能送进解析器(否则会被误判);仅记日志便于线上观测,不进用户可见文案
+			console.error(`GKYbot 查询失败: HTTP ${response.status} (tgid=${chatId})`);
+			return JSON.stringify({ success: false, banned: false, tgid: chatId, error: 'GKYbot 返回 HTTP ' + response.status });
+		}
+		const html = await response.text();
 
-	// 解析 HTML 内容
-	const result = parseBanlistHTML(html, chatId);
+		// 解析 HTML 内容
+		const result = parseBanlistHTML(html, chatId);
 
-	return JSON.stringify(result);
+		return JSON.stringify(result);
+	} catch (error) {
+		// 异常不得上抛给调用方,统一返回同构失败 JSON
+		console.error(`GKYbot 查询异常: ${error.message} (tgid=${chatId})`);
+		return JSON.stringify({ success: false, banned: false, tgid: chatId, error: error.message });
+	}
 }
 
 // 通过群组ID获取群组信息
@@ -5185,10 +7070,22 @@ async function restrictUserInChat(chatId, userId) {
 	return result;
 }
 
+// 联网查杀通知专用:被查杀用户名脱敏展示(首尾保留、中间 ***,防广告/违规用户名被 bot 复读造成二次传播)。
+// 复用 maskDisplayName(Unicode 码点安全,定义见本文件 /ad 区块);脱敏后仍保留 tg://user 链接
+// (回调侧 text_mention 实体复原与管理员核对均依赖该链接);无可展示名称时返回 null,
+// 由调用方兜底为纯 TGID 链接(TGID 本身无广告内容)。
+function formatMaskedUserMention(user) {
+	if (!user?.id) return null;
+	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || '';
+	if (!displayName) return null;
+	return `<a href="tg://user?id=${escapeHtml(user.id)}">${escapeHtml(maskDisplayName(displayName))}</a>`;
+}
+
 // 联网查杀"检测详情块"(通知与回调结果文案共用,保证操作后消息上半部分 UI 连续不跳变):
 // ⚠️ 标签行 + 联网黑名单命中说明 + 用户/TGID 详情。member 为被查杀用户对象(可为 null,兜底 tgid 链接)。
+// 用户名为脱敏展示(与 /spam /ban 封禁通知口径一致,防广告用户名二次传播),脱敏后仍保留 tg://user 链接。
 function buildNetKillDetailSection(member, tgid) {
-	const mention = (member && formatUserMention(member))
+	const mention = (member && formatMaskedUserMention(member))
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
 	return `⚠️ <b>#黑名单用户检测</b>
 
